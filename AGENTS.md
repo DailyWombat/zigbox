@@ -4,14 +4,15 @@ Zigbox is a rootless, daemonless Linux container runtime, image store and builde
 
 ## Rules
 
+- **Style and testing follow [docs/STYLE.md](docs/STYLE.md)** (TigerStyle, adapted). Read it before writing code. Review rejects code that breaks it.
 - Work one milestone at a time, from its brief in `docs/briefs/`. Do not start a later milestone or build anything listed under Non-goals.
 - A milestone is done only when its demo script runs live in the test VM. Unit tests passing, or code that compiles, is never reported as a passed demo. Say exactly what was and was not run.
 - Each demo script becomes an automated test, `zig build demo-mN`. Never break an earlier demo: all prior `demo-mN` tests run in CI.
 - Error messages are part of the demo: one line saying what was refused and why, never an `errno` dump.
 - When scope is in doubt, cut scope and keep the demo. Record the cut in the milestone's `DEMO.md`.
 - Zig version is pinned in `build.zig.zon` (`minimum_zig_version`) and CI. Do not upgrade during a milestone.
-- Standard library first. Any third-party dependency needs a written reason in the PR description.
-- No libc: never set `link_libc`. Release targets are `x86_64-linux` and `aarch64-linux`, static, built with `-Doptimize=ReleaseSmall`.
+- No third-party dependencies; standard library only (see STYLE.md for the allowed external programs).
+- No libc: never set `link_libc`. Release targets are `x86_64-linux` and `aarch64-linux`, static, built `ReleaseSafe` so assertions stay on.
 - The pinned Zig is newer than most model training data, and std APIs (I/O, `std.Io`, readers/writers, build system) changed in 0.15–0.17. Read the pinned std source (`$(zig env | jq -r .lib_dir)/std`) before using an API; do not write from memory.
 - All namespace work happens in a single-threaded child before `execve`. Thread pools only in the parent.
 - Never run anything with `sudo` in tests on a developer's host. Privileged setup (sysctl toggles) happens only inside the test VM.
@@ -25,10 +26,17 @@ Zigbox is a rootless, daemonless Linux container runtime, image store and builde
 ## Commands
 
 - `zig build` builds `zig-out/bin/zbx`.
-- `zig build test` runs unit tests.
-- `zig build demo-mN` runs milestone N's demo inside the test VM (see `test/vm/`).
+- `zig build test` runs unit, snapshot and simulation tests.
+- `zig build tidy` checks line length, function length and banned patterns.
+- `zig build fuzz -- <fuzzer> [seed]` runs one seeded fuzzer.
+- `zig build demo-mN` runs milestone N's demo inside the test VM (harness in `src/testing/vm/`, written in Zig).
+
+## Working as the implementer subagent
+
+- Work in slices as the brief defines them. At the end of each slice, commit locally and stop with a report. **Do not push.** The supervisor reviews each slice adversarially, and you fix what the review finds before the next slice.
+- Report what you ran and its output, what you did not run and why, every deviation from the brief, and anything in the spec or brief that seemed wrong.
 
 ## Git
 
-- Develop on the branch you were given; commit in small, meaningful steps; push with `git push -u origin <branch>`.
+- Develop on the branch you were given and commit in small, meaningful steps. The supervisor pushes, with `git push -u origin <branch>`, after review.
 - Never report an unpushed commit as pushed.
