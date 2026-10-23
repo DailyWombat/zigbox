@@ -12,7 +12,7 @@ A rootless, daemonless Linux container runtime, image store and builder, written
 
 | Milestone | What it adds | Status |
 | --- | --- | --- |
-| **M0 · Doctor** | `zbx doctor`: is this host ready to run Zigbox? | **In progress**: slice 1 built and reviewed; slice 2 in review; slice 3 not started |
+| **M0 · Doctor** | `zbx doctor`: is this host ready to run Zigbox? | **In progress**: slices 1 and 2 built and reviewed; slice 3 (VM demo and CI) not started |
 | M1 · Shell | Run a shell in a rootless, isolated root filesystem | Not started |
 | M2 · Limits | cgroup limits, capabilities, seccomp, read-only root | Not started |
 | M3 · Store | Content-addressed, deduplicated file trees | Not started |
@@ -30,10 +30,10 @@ M0 is built in three slices. Each is reviewed adversarially before it is pushed.
 | Slice | Contents | Status |
 | --- | --- | --- |
 | 1 · Foundations | Zig 0.17.0 pinned; `build`, `test`, `tidy`, `fuzz` and `release` steps; limits in `src/constants.zig`; the host interface (`src/host.zig`) with real and simulated implementations; `zbx --version` and `zbx help`; the style checker; the seeded fuzz runner; release size gate (under 2 MiB) | **Built and reviewed.** Unit, snapshot and fuzz tests pass. Release binaries: x86_64 305 KB, aarch64 214 KB (stripped, static, ReleaseSafe). |
-| 2 · Doctor logic | The six `zbx doctor` checks (kernel, user namespaces, cgroup delegation, overlayfs, subuid/subgid, seccomp); real probes; parsers; fixtures from real systems; fault-injection fuzzers | **In review, not merged.** Review found that the namespace probes fail for ordinary (non-root) users. Being fixed, along with a stricter cgroup delegation check. |
+| 2 · Doctor logic | The six `zbx doctor` checks (kernel, user namespaces, cgroup delegation to the systemd user manager, overlayfs, subuid/subgid with `newuidmap`/`newgidmap`, seccomp); real probes in a forked child; parsers; 42 snapshot fixtures of real and broken hosts; 12 seeded fuzzers | **Built and reviewed.** Runs for real on the build container (root and ordinary users); verdicts on a real Ubuntu host await slice 3. Release binaries: x86_64 366 KB, aarch64 269 KB. |
 | 3 · VM and CI | QEMU test VM harness in Zig, `zig build demo-m0`, GitHub Actions workflow, `DEMO.md` | Not started |
 
-**What works today on this branch:** `zbx --version`, `zbx help`, and clear one-line errors for bad input. `zbx doctor` prints "not implemented in this slice" and exits 1 until slice 2 is merged.
+**What works today on this branch:** `zbx --version`, `zbx help`, clear one-line errors for bad input, and `zbx doctor`, which checks this host and names the fix for every failure. It has run only on the cgroup v1 build container so far; the M0 demo on a clean Ubuntu 24.04 VM is slice 3.
 
 ## Building
 
@@ -47,7 +47,7 @@ zig build fuzz -- <fuzzer> [seed]  # one seeded fuzzer; prints its seed so failu
 zig build release                  # static ReleaseSafe binaries for x86_64 and aarch64, size-checked
 ```
 
-Linux only, by design. Running containers will need unprivileged user namespaces, cgroup v2 with user delegation and the `uidmap` package; `zbx doctor` will check all of this once slice 2 lands.
+Linux only, by design. Running containers will need unprivileged user namespaces, cgroup v2 with user delegation and the `uidmap` package; `zbx doctor` checks all of this.
 
 ## License
 
