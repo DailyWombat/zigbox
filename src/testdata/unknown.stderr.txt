@@ -1,0 +1,1 @@
+zbx: unknown command 'frobnicate'; run 'zbx help'
