@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
     add_tidy_step(b);
     add_fuzz_step(b, options, target);
     add_release_step(b, options);
+    add_demo_step(b, options);
 }
 
 fn zbx_module(
@@ -58,6 +59,7 @@ fn add_test_step(
 ) void {
     const test_step = b.step("test", "Run unit, snapshot and simulation tests");
     const roots = [_][]const u8{
+        "src/testing/vm/main.zig",
         "src/main.zig",
         "src/tidy.zig",
         "src/fuzz.zig",
@@ -153,4 +155,46 @@ fn add_release_step(b: *std.Build, options: *std.Build.Step.Options) void {
         check.addFileArg(exe.getEmittedBin());
     }
     if (strip) step.dependOn(&check.step);
+}
+
+/// `zig build demo-m0`: the milestone demo in a real Ubuntu VM. It always uses the stripped
+/// ReleaseSafe binaries, the ones that ship. -Daccel=kvm|tcg|auto chooses the accelerator:
+/// auto means KVM and fails with a one-line message if /dev/kvm is unusable; tcg (software
+/// emulation, much slower) must be asked for explicitly.
+fn add_demo_step(b: *std.Build, options: *std.Build.Step.Options) void {
+    const Accel = enum { auto, kvm, tcg };
+    const accel_help = "VM accelerator for demo-m0: auto (default), kvm, tcg";
+    const accel = b.option(Accel, "accel", accel_help) orelse .auto;
+    const dropin_help = "demo-m0: provision a Delegate= drop-in for user managers";
+    const dropin = b.option(bool, "delegate-dropin", dropin_help) orelse false;
+    const keep_help = "demo-m0: keep the VM disk overlay (development)";
+    const keep = b.option(bool, "keep-overlay", keep_help) orelse false;
+    const reuse_help = "demo-m0: boot the kept, provisioned overlay (development)";
+    const reuse = b.option(bool, "reuse-overlay", reuse_help) orelse false;
+
+    const vm = b.addExecutable(.{
+        .name = "vm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/main.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run = b.addRunArtifact(vm);
+    run.setCwd(b.path("."));
+    run.addArgs(&.{ "--accel", @tagName(accel) });
+    if (dropin) run.addArg("--delegate-dropin");
+    if (keep) run.addArg("--keep-overlay");
+    if (reuse) run.addArg("--reuse-overlay");
+    const flags = [_][]const u8{ "--zbx-x86_64", "--zbx-aarch64" };
+    for (release_targets, flags) |query, flag| {
+        const exe = b.addExecutable(.{
+            .name = "zbx",
+            .root_module = zbx_module(b, options, b.resolveTargetQuery(query), .ReleaseSafe, true),
+        });
+        run.addArg(flag);
+        run.addFileArg(exe.getEmittedBin());
+    }
+    const step = b.step("demo-m0", "Run the M0 demo in a real Ubuntu 24.04 VM (see docs/DEMO.md)");
+    step.dependOn(&run.step);
 }
