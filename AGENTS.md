@@ -36,6 +36,10 @@ Zigbox is a rootless, daemonless Linux container runtime, image store and builde
 - Work in slices as the brief defines them. At the end of each slice, commit locally and stop with a report. **Do not push.** The supervisor reviews each slice adversarially, and you fix what the review finds before the next slice.
 - Report what you ran and its output, what you did not run and why, every deviation from the brief, and anything in the spec or brief that seemed wrong.
 
+## README status
+
+- [README.md](README.md) holds the status of every milestone and slice: what is built and reviewed, what is in review, and what is not started. The supervisor updates it in the same push that changes the status. Never mark anything "demonstrated" until its `demo-mN` job is green in CI.
+
 ## Git
 
 - Develop on the branch you were given and commit in small, meaningful steps. The supervisor pushes, with `git push -u origin <branch>`, after review.

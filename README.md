@@ -1,0 +1,54 @@
+# Zigbox
+
+A rootless, daemonless Linux container runtime, image store and builder, written in Zig, designed as if Docker were being invented today. Every milestone ends in a demo a person can watch work in under five minutes.
+
+- **Design:** [docs/SPEC.md](docs/SPEC.md), a snapshot of the [live design doc](https://claude.ai/artifact/6D9js8mxSLYmfuZe3rQ26w).
+- **How the code is written and tested:** [docs/STYLE.md](docs/STYLE.md) (TigerBeetle's TigerStyle, adapted).
+- **Rules for contributors and agents:** [AGENTS.md](AGENTS.md).
+
+## Status
+
+*As of 2026-10-23. Nothing is demonstrated yet: no milestone's demo has run in the test VM.*
+
+| Milestone | What it adds | Status |
+| --- | --- | --- |
+| **M0 · Doctor** | `zbx doctor`: is this host ready to run Zigbox? | **In progress**: slice 1 built and reviewed; slice 2 in review; slice 3 not started |
+| M1 · Shell | Run a shell in a rootless, isolated root filesystem | Not started |
+| M2 · Limits | cgroup limits, capabilities, seccomp, read-only root | Not started |
+| M3 · Store | Content-addressed, deduplicated file trees | Not started |
+| M4 · Pull | Pull and run public OCI images | Not started |
+| M5 · Network | No network unless granted; published ports via `pasta` | Not started |
+| M6 · State | Named, listed state volumes | Not started |
+| M7 · Build | Hermetic, reproducible builds from a step DAG | Not started |
+| M8 · Trust | Signatures, provenance and a run policy | Not started |
+| S1–S5 | Stretch: microVMs, lazy start, egress grants, Dockerfile import, WASM | Not started |
+
+### M0 in detail
+
+M0 is built in three slices. Each is reviewed adversarially before it is pushed.
+
+| Slice | Contents | Status |
+| --- | --- | --- |
+| 1 · Foundations | Zig 0.17.0 pinned; `build`, `test`, `tidy`, `fuzz` and `release` steps; limits in `src/constants.zig`; the host interface (`src/host.zig`) with real and simulated implementations; `zbx --version` and `zbx help`; the style checker; the seeded fuzz runner; release size gate (under 2 MiB) | **Built and reviewed.** Unit, snapshot and fuzz tests pass. Release binaries: x86_64 305 KB, aarch64 214 KB (stripped, static, ReleaseSafe). |
+| 2 · Doctor logic | The six `zbx doctor` checks (kernel, user namespaces, cgroup delegation, overlayfs, subuid/subgid, seccomp); real probes; parsers; fixtures from real systems; fault-injection fuzzers | **In review, not merged.** Review found that the namespace probes fail for ordinary (non-root) users. Being fixed, along with a stricter cgroup delegation check. |
+| 3 · VM and CI | QEMU test VM harness in Zig, `zig build demo-m0`, GitHub Actions workflow, `DEMO.md` | Not started |
+
+**What works today on this branch:** `zbx --version`, `zbx help`, and clear one-line errors for bad input. `zbx doctor` prints "not implemented in this slice" and exits 1 until slice 2 is merged.
+
+## Building
+
+Requires Zig 0.17.0 exactly ([download](https://ziglang.org/download/)). There are no other dependencies.
+
+```sh
+zig build                          # zig-out/bin/zbx (debug)
+zig build test                     # unit, snapshot and simulation tests
+zig build tidy                     # formatting and mechanical style rules
+zig build fuzz -- <fuzzer> [seed]  # one seeded fuzzer; prints its seed so failures replay
+zig build release                  # static ReleaseSafe binaries for x86_64 and aarch64, size-checked
+```
+
+Linux only, by design. Running containers will need unprivileged user namespaces, cgroup v2 with user delegation and the `uidmap` package; `zbx doctor` will check all of this once slice 2 lands.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

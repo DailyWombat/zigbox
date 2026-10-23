@@ -36,7 +36,7 @@ Design goals, in order: **safety, performance, developer experience.**
 - `snake_case` for files, functions and variables. No abbreviations (`source`/`target`, not `src`/`dst`). Put units and qualifiers last: `size_bytes_max`, `timeout_ms`.
 - Use an options struct when two arguments could be swapped. Pass library options explicitly at the call site rather than relying on defaults.
 - Pass arguments over 16 bytes as `*const`. Initialise large structs in place through an out pointer.
-- Split compound conditions into nested `if`/`else`. State invariants positively (`if (index < count)`).
+- Split compound conditions into nested `if`/`else`. State invariants positively (`if (index < count)`). Exception: test code, reference oracles in fuzzers, and build-host tooling (`tidy`, `size_check`) may use compound conditions in branches, because an oracle that mirrors the production code's structure stops being independent. Compound *assertions* are banned everywhere.
 - Make the rounding intent of every division explicit (`@divExact`, `@divFloor`, `std.math.divCeil`).
 - Handle every error. `catch unreachable` is allowed only with an assertion-grade comment explaining why the error cannot occur.
 - Comments say **why** and are full sentences. Each test opens with a comment giving its goal and method.
