@@ -22,14 +22,6 @@ pub const Error = error{
     Unsupported,
 };
 
-/// True if `inner` lies inside `outer`: parsers return slices of their input, never copies.
-fn within(outer: []const u8, inner: []const u8) bool {
-    const start = @intFromPtr(outer.ptr);
-    const inner_start = @intFromPtr(inner.ptr);
-    if (inner_start < start) return false;
-    return inner_start + inner.len <= start + outer.len;
-}
-
 // ---- Byte classes --------------------------------------------------------------------------
 
 fn is_digit(byte: u8) bool {
@@ -43,20 +35,9 @@ fn is_visible(byte: u8) bool {
     return byte <= 0x7e;
 }
 
-fn is_control(byte: u8) bool {
-    if (byte < 0x20) return true;
-    return byte == 0x7f;
-}
-
 fn is_blank(byte: u8) bool {
     if (byte == ' ') return true;
     return byte == '\t';
-}
-
-/// A cgroup v1 controller name: letters, digits and `_ = - .` (`name=systemd`, `cpu,cpuacct`).
-fn is_cgroup_name_byte(byte: u8) bool {
-    if (std.ascii.isAlphanumeric(byte)) return true;
-    return std.mem.indexOfScalar(u8, "_=-.", byte) != null;
 }
 
 /// A cgroup v2 controller name: lowercase letters, digits and underscore.
@@ -97,6 +78,8 @@ fn parse_decimal(digits: []const u8, digits_max: u32) Error!u64 {
 
 fn parse_u32(digits: []const u8) Error!u32 {
     const value = try parse_decimal(digits, 10);
+    assert(digits.len > 0); // An empty string is an error above, never zero.
+    assert(digits.len <= 10);
     if (value > std.math.maxInt(u32)) return error.Overflow;
     return @intCast(value);
 }
@@ -159,6 +142,7 @@ fn read_number(text: []const u8, index: *usize) Error!u32 {
 
 fn check_release_suffix(suffix: []const u8) Error!void {
     assert(suffix.len > 0);
+    assert(suffix.len < constants.uname_field_bytes);
     const starts = "-+_~";
     if (std.mem.indexOfScalar(u8, starts, suffix[0]) == null) return error.Malformed;
     for (suffix) |byte| {
@@ -166,85 +150,7 @@ fn check_release_suffix(suffix: []const u8) Error!void {
     }
 }
 
-// ---- cgroup ------------------------------------------------------------------------------
-
-pub const CgroupSelf = struct {
-    /// The path of the cgroup v2 ("0::/path") entry, a slice of the input; null on v1-only hosts.
-    unified_path: ?[]const u8,
-    /// Entries for cgroup v1 hierarchies.
-    legacy_hierarchies: u32,
-};
-
-/// `/proc/self/cgroup`: one `ID:CONTROLLERS:PATH` line per hierarchy, each ending in a newline.
-/// The unified (v2) entry has ID 0 and no controllers.
-pub fn parse_cgroup_self(text: []const u8) Error!CgroupSelf {
-    if (text.len == 0) return error.Empty;
-    if (text[text.len - 1] != '\n') return error.Malformed; // Truncated last line.
-    var result: CgroupSelf = .{ .unified_path = null, .legacy_hierarchies = 0 };
-    var lines = std.mem.splitScalar(u8, text[0 .. text.len - 1], '\n');
-    var count: u32 = 0;
-    while (lines.next()) |line| {
-        count += 1;
-        if (count > constants.cgroup_lines_max) return error.TooMany;
-        const entry = try parse_cgroup_line(line);
-        if (entry.unified) {
-            if (result.unified_path != null) return error.Duplicate;
-            result.unified_path = entry.path;
-        } else {
-            result.legacy_hierarchies += 1;
-        }
-    }
-    assert(count > 0);
-    if (result.unified_path) |path| assert(within(text, path));
-    return result;
-}
-
-const CgroupLine = struct { unified: bool, path: []const u8 };
-
-fn parse_cgroup_line(line: []const u8) Error!CgroupLine {
-    const first = std.mem.indexOfScalar(u8, line, ':') orelse return error.Malformed;
-    const second = std.mem.indexOfScalarPos(u8, line, first + 1, ':') orelse return error.Malformed;
-    const identifier = try parse_decimal(line[0..first], 10);
-    const controllers = line[first + 1 .. second];
-    const path = line[second + 1 ..];
-    try check_cgroup_controllers(controllers);
-    try check_cgroup_path(path);
-    if (identifier == 0) {
-        if (controllers.len > 0) return error.Malformed;
-    }
-    assert(within(line, path));
-    if (identifier == 0) assert(controllers.len == 0);
-    return .{ .unified = identifier == 0, .path = path };
-}
-
-fn check_cgroup_controllers(controllers: []const u8) Error!void {
-    if (controllers.len == 0) return;
-    var names = std.mem.splitScalar(u8, controllers, ',');
-    while (names.next()) |name| {
-        if (name.len == 0) return error.Malformed;
-        for (name) |byte| {
-            if (!is_cgroup_name_byte(byte)) return error.Malformed;
-        }
-    }
-}
-
-/// An absolute, normalised path without control bytes: no empty, "." or ".." components, so a
-/// hostile or corrupt file cannot steer a later read out of /sys/fs/cgroup.
-fn check_cgroup_path(path: []const u8) Error!void {
-    if (path.len == 0) return error.Malformed;
-    if (path[0] != '/') return error.Malformed;
-    if (path.len > constants.cgroup_self_bytes_max) return error.TooLong;
-    for (path) |byte| {
-        if (is_control(byte)) return error.Malformed;
-    }
-    if (path.len == 1) return;
-    var components = std.mem.splitScalar(u8, path[1..], '/');
-    while (components.next()) |component| {
-        if (component.len == 0) return error.Malformed;
-        if (std.mem.eql(u8, component, ".")) return error.Malformed;
-        if (std.mem.eql(u8, component, "..")) return error.Malformed;
-    }
-}
+// ---- cgroup controllers --------------------------------------------------------------------
 
 pub const Controller = enum(u4) { cpuset, cpu, io, memory, hugetlb, pids, rdma, misc };
 
@@ -266,12 +172,14 @@ pub const ControllerSet = struct {
         if (set.has(controller)) return error.Duplicate;
         set.bits |= @as(u16, 1) << @backingInt(controller);
         assert(set.has(controller));
+        assert(set.bits != 0);
     }
 };
 
 /// `cgroup.controllers` and `cgroup.subtree_control`: space-separated lowercase names and a
 /// newline. An empty list is valid.
 pub fn parse_controller_list(text: []const u8) Error!ControllerSet {
+    if (text.len > constants.cgroup_list_bytes_max) return error.TooLong;
     const body = if (std.mem.endsWith(u8, text, "\n")) text[0 .. text.len - 1] else text;
     var set: ControllerSet = .{};
     if (body.len == 0) return set;
@@ -312,6 +220,7 @@ pub const SubidRanges = struct {
 /// `/etc/subuid` or `/etc/subgid`: `NAME_OR_UID:START:COUNT` lines. An entry matches the user
 /// by name or by the decimal UID; both forms are legal and both are checked.
 pub fn parse_subid(text: []const u8, user_name: ?[]const u8, uid: u32) SubidRanges {
+    assert(uid != std.math.maxInt(u32)); // (uid_t)-1 is never a real owner.
     var uid_buffer: [10]u8 = undefined;
     const uid_text = std.fmt.bufPrint(&uid_buffer, "{d}", .{uid}) catch unreachable; // 10 fits.
     var result: SubidRanges = .{};
@@ -357,6 +266,8 @@ fn parse_subid_line(line: []const u8) ?SubidLine {
     const count = parse_u32(count_text) catch return null;
     // The range must fit the 32-bit id space.
     if (@as(u64, start) + count > (1 << 32)) return null;
+    assert(owner.len > 0);
+    assert(std.mem.indexOfScalar(u8, owner, ':') == null); // Fields were split on colons.
     return .{ .owner = owner, .start = start, .count = count };
 }
 
@@ -368,6 +279,7 @@ pub const PasswdLookup = struct {
 /// `/etc/passwd`: `NAME:PASSWORD:UID:GID:GECOS:HOME:SHELL`. Returns the name of the first
 /// well-formed entry with this UID.
 pub fn parse_passwd_name(text: []const u8, uid: u32) PasswdLookup {
+    assert(uid != std.math.maxInt(u32)); // (uid_t)-1 is never a real owner.
     var result: PasswdLookup = .{};
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -400,6 +312,8 @@ fn parse_passwd_line(line: []const u8) ?PasswdLine {
     }
     const uid = parse_u32(values[2]) catch return null;
     _ = parse_u32(values[3]) catch return null;
+    assert(name.len > 0);
+    assert(std.mem.indexOfScalar(u8, name, ':') == null); // Fields were split on colons.
     return .{ .name = name, .uid = uid };
 }
 
@@ -408,6 +322,7 @@ fn parse_passwd_line(line: []const u8) ?PasswdLine {
 /// The value of the `Seccomp:` line: 0 (disabled), 1 (strict) or 2 (filter). The line must
 /// appear exactly once as `Seccomp:` then spaces or tabs then a single digit.
 pub fn parse_seccomp_status(text: []const u8) Error!u32 {
+    assert(text.len <= constants.status_bytes_max); // Bounded by the read that produced it.
     const key = "Seccomp:";
     var found: ?u32 = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -426,11 +341,13 @@ fn parse_seccomp_value(rest: []const u8) Error!u32 {
     while (index < rest.len) : (index += 1) {
         if (!is_blank(rest[index])) break;
     }
+    assert(index <= rest.len);
     if (index == 0) return error.Malformed;
     if (rest.len - index != 1) return error.Malformed;
     const digit = rest[index];
     if (digit < '0') return error.Malformed;
     if (digit > '2') return error.Malformed;
+    assert(is_digit(digit));
     return digit - '0';
 }
 
@@ -521,34 +438,6 @@ test "kernel release: real strings parse, malformed ones do not" {
     };
     for (bad) |text| try testing.expect(std.meta.isError(parse_kernel_release(text)));
     try testing.expectError(error.TooLong, parse_kernel_release(repeat('1', 65)));
-}
-
-test "cgroup self: v2, hybrid, v1 and malformed inputs" {
-    // Goal: the unified entry is found; hybrid and v1 hosts are told apart; traversal is refused.
-    const v2 = try parse_cgroup_self("0::/user.slice/user-1000.slice/session-3.scope\n");
-    const session = "/user.slice/user-1000.slice/session-3.scope";
-    try testing.expectEqualStrings(session, v2.unified_path.?);
-    try testing.expectEqual(@as(u32, 0), v2.legacy_hierarchies);
-
-    const root = try parse_cgroup_self("0::/\n");
-    try testing.expectEqualStrings("/", root.unified_path.?);
-
-    const hybrid = try parse_cgroup_self("12:pids:/a\n1:name=systemd:/a\n0::/a\n");
-    try testing.expectEqualStrings("/a", hybrid.unified_path.?);
-    try testing.expectEqual(@as(u32, 2), hybrid.legacy_hierarchies);
-
-    const v1 = try parse_cgroup_self("4:memory:/docker/x\n3:cpu,cpuacct:/docker/x\n");
-    try testing.expect(v1.unified_path == null);
-    try testing.expectEqual(@as(u32, 2), v1.legacy_hierarchies);
-
-    const bad = [_][]const u8{
-        "",               "0::/a",         "0::a\n",      "0::/a/../b\n",
-        "0::/a/./b\n",    "0::/a//b\n",    "0::/a/\n",    "0:cpu:/a\n",
-        "x::/a\n",        "00::/a\n",      "0:/a\n",      "0::/a\x00b\n",
-        "0::/a\n0::/b\n", "1:cp u:/a\n",   "1:,cpu:/a\n", "\n",
-        "0::/a\n\n",      "0::/\x1b[2J\n",
-    };
-    for (bad) |text| try testing.expect(std.meta.isError(parse_cgroup_self(text)));
 }
 
 test "controller lists: sets, empty lists, duplicates and junk" {

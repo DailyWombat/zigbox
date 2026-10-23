@@ -30,6 +30,20 @@ const files_max: u32 = 10_000;
 /// entry needs a written reason next to it. Empty on purpose.
 const shell_allowlist = [_][]const u8{};
 
+/// The files that make up the shipped `zbx` binary. Their functions must average at least
+/// `asserts_per_function_min` runtime assertions (docs/STYLE.md). Test and tooling code is
+/// exempt from the number.
+const shipped_files = [_][]const u8{
+    "src/cli.zig",
+    "src/doctor.zig",
+    "src/host.zig",
+    "src/host_real.zig",
+    "src/main.zig",
+    "src/parse.zig",
+    "src/text.zig",
+};
+const asserts_per_function_min: u32 = 2;
+
 const module_allowlist = [_][]const u8{ "std", "builtin", "build_options" };
 
 const skipped_directories = [_][]const u8{ ".git", ".zig-cache", "zig-out", "zig-pkg" };
@@ -83,6 +97,9 @@ pub const Report = struct {
     count: u32 = 0,
     /// Violations beyond capacity are counted but not stored.
     dropped: u32 = 0,
+    /// Functions (not tests) before the test section, and the runtime assertions in them.
+    functions: u32 = 0,
+    asserts: u32 = 0,
 
     fn add(report: *Report, line: u32, rule: Rule) void {
         assert(report.count <= violations_per_file_max);
@@ -234,6 +251,11 @@ const Frame = struct {
     kind: BraceKind,
     /// For function bodies, the line of the function header.
     start_line: u32,
+    /// For function bodies: a `test` block, not a function.
+    is_test: bool = false,
+    /// For function bodies: runtime assertions seen inside (nested frames count for the
+    /// innermost function only).
+    asserts: u32 = 0,
 };
 
 const Scanner = struct {
@@ -246,16 +268,23 @@ const Scanner = struct {
     /// The pending function's name is not snake_case; reported when its body opens, unless the
     /// return type turns out to be `type` (Zig's convention for type constructors).
     pending_bad_name: bool = false,
+    pending_is_test: bool = false,
+    /// Set at `const testing = std.testing;` or the first `test` block: by convention everything
+    /// after it is test support and does not count towards assertion density.
+    in_test_section: bool = false,
     stopped: bool = false,
 
     fn scan_line(scanner: *Scanner, line: u32, code: []const u8) void {
         assert(line > 0);
         assert(scanner.depth <= brace_depth_max);
         if (scanner.stopped) return;
+        scanner.note_test_section(code);
+        scanner.count_asserts(code);
         if (scanner.pending_line == 0 and starts_function_header(code)) {
             scanner.pending_line = line;
             scanner.paren_depth = 0;
             scanner.pending_bad_name = false;
+            scanner.pending_is_test = is_test_header(code);
             if (function_name(code)) |name| scanner.pending_bad_name = !is_snake_case(name);
         }
         if (scanner.depth > 0 and scanner.stack[scanner.depth - 1].kind == .container) {
@@ -296,8 +325,33 @@ const Scanner = struct {
             scanner.pending_line = 0;
             scanner.pending_bad_name = false;
         }
-        scanner.stack[scanner.depth] = .{ .kind = kind, .start_line = start_line };
+        const is_test = kind == .function_body and scanner.pending_is_test;
+        scanner.stack[scanner.depth] = .{
+            .kind = kind,
+            .start_line = start_line,
+            .is_test = is_test,
+        };
         scanner.depth += 1;
+    }
+
+    fn note_test_section(scanner: *Scanner, code: []const u8) void {
+        const trimmed = std.mem.trimStart(u8, code, " ");
+        if (std.mem.startsWith(u8, trimmed, "const testing = std.testing;")) {
+            scanner.in_test_section = true;
+        }
+        if (scanner.depth == 0 and is_test_header(code)) scanner.in_test_section = true;
+    }
+
+    /// Adds the runtime assertions on this line to the innermost enclosing function body.
+    fn count_asserts(scanner: *Scanner, code: []const u8) void {
+        if (std.mem.indexOf(u8, code, "comptime") != null) return;
+        var frame_index = scanner.depth;
+        while (frame_index > 0) {
+            frame_index -= 1;
+            if (scanner.stack[frame_index].kind != .function_body) continue;
+            scanner.stack[frame_index].asserts += count_assert_calls(code);
+            return;
+        }
     }
 
     fn close(scanner: *Scanner, line: u32) void {
@@ -314,8 +368,34 @@ const Scanner = struct {
         if (length > function_lines_max) {
             scanner.report.add(frame.start_line, .function_too_long);
         }
+        if (frame.is_test) return;
+        if (scanner.in_test_section) return;
+        scanner.report.functions += 1;
+        scanner.report.asserts += frame.asserts;
     }
 };
+
+fn is_test_header(code: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, code, " ");
+    if (std.mem.startsWith(u8, trimmed, "test ")) return true;
+    if (std.mem.startsWith(u8, trimmed, "test{")) return true;
+    return std.mem.eql(u8, trimmed, "test");
+}
+
+/// Occurrences of `assert(` as a call (not part of a longer name) in a code view.
+fn count_assert_calls(code: []const u8) u32 {
+    const needle = "assert(";
+    var count: u32 = 0;
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, code, offset, needle)) |found| {
+        offset = found + needle.len;
+        if (found > 0) {
+            if (is_word_byte(code[found - 1])) continue;
+        }
+        count += 1;
+    }
+    return count;
+}
 
 /// The identifier after `fn` on a header line, or null for tests and unnamed forms.
 fn function_name(code: []const u8) ?[]const u8 {
@@ -531,6 +611,20 @@ fn print_violations(out: *std.Io.Writer, path: []const u8, report: *const Report
     if (report.dropped > 0) try out.print("{s}: {d} more not shown\n", .{ path, report.dropped });
 }
 
+/// True if `asserts` meets the minimum average over `functions` functions.
+pub fn density_ok(asserts: u32, functions: u32) bool {
+    assert(asserts_per_function_min > 0);
+    if (functions == 0) return false; // The shipped-file list matched nothing: a config error.
+    return asserts >= asserts_per_function_min * functions;
+}
+
+fn is_shipped(path: []const u8) bool {
+    for (shipped_files) |name| {
+        if (std.mem.eql(u8, name, path)) return true;
+    }
+    return false;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -545,6 +639,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     var violations: u32 = 0;
     var files: u32 = 0;
+    var shipped_functions: u32 = 0;
+    var shipped_asserts: u32 = 0;
     while (try walker.next(io)) |entry| {
         if (entry.kind == .directory) {
             if (!skipped(entry.basename)) try walker.enter(io, entry);
@@ -563,7 +659,21 @@ pub fn main(init: std.process.Init) !u8 {
         }
         try print_violations(out, entry.path, &report);
         violations += report.total();
+        if (is_shipped(entry.path)) {
+            shipped_functions += report.functions;
+            shipped_asserts += report.asserts;
+        }
     }
+    if (!density_ok(shipped_asserts, shipped_functions)) {
+        try out.print(
+            "shipped code: {d} assertions in {d} functions, below {d} per function\n",
+            .{ shipped_asserts, shipped_functions, asserts_per_function_min },
+        );
+        violations += 1;
+    }
+    try out.print("tidy: assertions per function in shipped code: {d} over {d} functions\n", .{
+        shipped_asserts, shipped_functions,
+    });
     if (violations == 0) {
         try out.print("tidy: ok ({d} files checked)\n", .{files});
     } else {
@@ -851,6 +961,48 @@ test "unbalanced braces are reported instead of mis-measuring" {
     try testing.expect(report.contains(.unbalanced_braces, 2));
     check_text(&report, "}\n");
     try testing.expect(report.contains(.unbalanced_braces, 1));
+}
+
+test "assertion density counts runtime assertions per function before the test section" {
+    // Goal: functions and their assertions are counted; comptime asserts, tests, nested names
+    // like `expect_assert(` and everything after the test marker are not.
+    var report: Report = undefined;
+    check_text(&report,
+        \\fn one() void {
+        \\    assert(a);
+        \\    assert(b);
+        \\    comptime assert(c);
+        \\    expect_assert(d);
+        \\    std.debug.assert(e);
+        \\}
+        \\fn none() void {}
+        \\const T = struct {
+        \\    fn method() void {
+        \\        assert(f);
+        \\    }
+        \\};
+        \\test "t" {
+        \\    assert(g);
+        \\}
+        \\const testing = std.testing;
+        \\fn helper() void {
+        \\    assert(h);
+        \\}
+        \\
+    );
+    try testing.expectEqual(@as(u32, 3), report.functions);
+    try testing.expectEqual(@as(u32, 4), report.asserts);
+}
+
+test "assertion density threshold: at least two per function, and never on zero functions" {
+    // Goal: the boundary of the average, and a config error (no functions) fails.
+    try testing.expect(density_ok(4, 2));
+    try testing.expect(density_ok(5, 2));
+    try testing.expect(!density_ok(3, 2));
+    try testing.expect(!density_ok(0, 1));
+    try testing.expect(density_ok(0, 0) == false);
+    try testing.expect(density_ok(2, 1));
+    try testing.expect(!density_ok(1, 1));
 }
 
 test "the repository's own sources are clean" {

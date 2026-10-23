@@ -69,6 +69,7 @@ pub const HostReal = struct {
         const self = from_context(context);
         assert(self.open_count > 0);
         self.open_count -= 1;
+        assert(handle <= std.math.maxInt(i32)); // A descriptor, as open_read produced it.
         const descriptor: i32 = @intCast(handle);
         // A close error on a read-only descriptor loses no data and cannot be acted on.
         _ = linux.close(descriptor);
@@ -135,6 +136,7 @@ pub const HostReal = struct {
         const result = linux.prctl(@backingInt(linux.PR.GET_SECCOMP), 0, 0, 0, 0);
         try check(result);
         assert(result <= std.math.maxInt(u32));
+        assert(result <= 2);
         return @intCast(result);
     }
 
@@ -164,6 +166,8 @@ pub const HostReal = struct {
     fn check(result: usize) host.Error!void {
         const code = linux.errno(result);
         if (code == .SUCCESS) return;
+        assert(code != .SUCCESS);
+        assert(@backingInt(code) != 0);
         return switch (code) {
             .INTR => error.Interrupted,
             .AGAIN => error.WouldBlock,
@@ -224,6 +228,8 @@ const nobody_id: u32 = 65534;
 const child_exit_ok: u8 = 0;
 const child_exit_refused_namespace: u8 = 10;
 const child_exit_refused_mount: u8 = 11;
+/// The namespace exists, but writing setgroups/uid_map/gid_map was refused.
+const child_exit_refused_map: u8 = 13;
 const child_exit_failed: u8 = 12;
 
 const scratch_names = [_][:0]const u8{ "work/work", "work", "upper", "lower", "merged" };
@@ -234,7 +240,10 @@ const Scratch = struct {
     root_len: u32,
     created: bool,
 
-    fn create(scratch: *Scratch, parent: []const u8, owner: u32) host.Error!void {
+    /// `give_to` is set only when the caller is root: the unprivileged child then needs to own the
+    /// directory. An ordinary caller already owns what it creates (and may not chown to a group
+    /// it is not in).
+    fn create(scratch: *Scratch, parent: []const u8, give_to: ?u32) host.Error!void {
         scratch.created = false;
         scratch.root_len = 0;
         if (parent.len == 0) return error.InvalidPath;
@@ -249,8 +258,7 @@ const Scratch = struct {
             try HostReal.check(result);
             scratch.root_len = @intCast(formatted.len);
             scratch.created = true;
-            // The child runs as `owner` and must be able to create entries inside.
-            if (owner != 0) try HostReal.check(linux.chown(formatted.ptr, owner, owner));
+            if (give_to) |owner| try HostReal.check(linux.chown(formatted.ptr, owner, owner));
             assert(scratch.root_len > parent.len);
             assert(scratch.root[scratch.root_len] == 0);
             return;
@@ -284,12 +292,13 @@ const Scratch = struct {
 
 fn probe_run(self: *HostReal, kind: host.ProbeKind) host.Error!host.ProbeOutcome {
     const caller = linux.getuid();
-    const unprivileged = if (caller == 0) nobody_id else caller;
-    assert(unprivileged != 0); // Probes never run as root.
+    const give_to: ?u32 = if (caller == 0) nobody_id else null;
     var scratch: Scratch = undefined;
     scratch.created = false;
-    if (kind == .overlay) try scratch.create(self.scratch_parent, unprivileged);
+    // Registered before create(): a failure after the directory exists (chown) must still
+    // remove it.
     defer scratch.remove();
+    if (kind == .overlay) try scratch.create(self.scratch_parent, give_to);
 
     var options: [3 * constants.probe_scratch_bytes_max + 64]u8 = undefined;
     const options_text = overlay_options(&options, &scratch);
@@ -333,6 +342,15 @@ fn child_main(
     assert(scratch.created == (kind == .overlay));
     if (kind == .overlay) assert(options.len > 0);
 
+    // The ids to map are read here, before the namespace exists: inside an unmapped user
+    // namespace getuid() and getgid() return the overflow id (65534), not the caller's.
+    const uid = linux.getuid();
+    const gid = linux.getgid();
+    assert(uid != 0); // Root was dropped to an unprivileged id above, or never was root.
+    // A caller that changed its ids is not dumpable, which makes /proc/self/*_map root-owned.
+    const dumpable = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
+    if (linux.errno(dumpable) != .SUCCESS) linux.exit_group(child_exit_failed);
+
     const flags: usize = switch (kind) {
         .userns => linux.CLONE.NEWUSER,
         .overlay => linux.CLONE.NEWUSER | linux.CLONE.NEWNS,
@@ -343,22 +361,23 @@ fn child_main(
     }
     // Map the caller's single id to root inside, as zbx itself will. A process with no mapping
     // can create the namespace but not do anything useful in it (overlay mounts are refused).
-    if (!map_single_ids()) linux.exit_group(child_exit_refused_namespace);
+    if (!map_single_ids(uid, gid)) linux.exit_group(child_exit_refused_map);
     if (kind == .userns) linux.exit_group(child_exit_ok);
 
     // Keep the mount from propagating back to the caller's namespace.
     const private = linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0);
-    if (linux.errno(private) != .SUCCESS) linux.exit_group(child_exit_refused_namespace);
+    if (linux.errno(private) != .SUCCESS) linux.exit_group(child_exit_refused_mount);
     linux.exit_group(overlay_mount(scratch, options));
 }
 
-/// Writes `/proc/self/{setgroups,uid_map,gid_map}` so that the current ids map to 0 inside.
-fn map_single_ids() bool {
+/// Writes `/proc/self/{setgroups,gid_map,uid_map}` so that `uid` and `gid` (the ids the process
+/// had before it entered the namespace) map to 0 inside. A map may only name ids the caller owns.
+fn map_single_ids(uid: u32, gid: u32) bool {
     var line: [32]u8 = undefined;
     if (!write_proc("/proc/self/setgroups", "deny")) return false;
-    const gid_line = std.fmt.bufPrint(&line, "0 {d} 1\n", .{linux.getgid()}) catch return false;
+    const gid_line = std.fmt.bufPrint(&line, "0 {d} 1\n", .{gid}) catch return false;
     if (!write_proc("/proc/self/gid_map", gid_line)) return false;
-    const uid_line = std.fmt.bufPrint(&line, "0 {d} 1\n", .{linux.getuid()}) catch return false;
+    const uid_line = std.fmt.bufPrint(&line, "0 {d} 1\n", .{uid}) catch return false;
     return write_proc("/proc/self/uid_map", uid_line);
 }
 
@@ -448,6 +467,7 @@ fn classify_status(status: u32, kind: host.ProbeKind) host.ProbeOutcome {
     return switch (linux.W.EXITSTATUS(status)) {
         child_exit_ok => .ok,
         child_exit_refused_namespace => if (kind == .userns) .denied else .setup_denied,
+        child_exit_refused_map => .map_denied,
         child_exit_refused_mount => .denied,
         else => .failed,
     };
@@ -471,6 +491,10 @@ fn hook_exit_ok() noreturn {
 
 fn hook_exit_namespace() noreturn {
     linux.exit_group(child_exit_refused_namespace);
+}
+
+fn hook_exit_map() noreturn {
+    linux.exit_group(child_exit_refused_map);
 }
 
 fn hook_exit_mount() noreturn {
@@ -507,6 +531,8 @@ test "probe child outcomes map from exit status, signal and timeout, and are all
         .{ .hook = hook_exit_namespace, .kind = .userns, .expected = .denied },
         .{ .hook = hook_exit_namespace, .kind = .overlay, .expected = .setup_denied },
         .{ .hook = hook_exit_mount, .kind = .overlay, .expected = .denied },
+        .{ .hook = hook_exit_map, .kind = .userns, .expected = .map_denied },
+        .{ .hook = hook_exit_map, .kind = .overlay, .expected = .map_denied },
         .{ .hook = hook_exit_other, .kind = .userns, .expected = .failed },
         .{ .hook = hook_kill_self, .kind = .userns, .expected = .signaled },
         .{ .hook = hook_sleep_forever, .kind = .userns, .expected = .timed_out },
@@ -525,6 +551,48 @@ test "the probe child runs unprivileged even when the caller is root" {
     // child is still uid 0. When this test runs as an ordinary user the child never was root.
     var real: HostReal = .{ .child_hook = hook_exit_ok_if_unprivileged, .probe_timeout_ms = 1000 };
     try std.testing.expectEqual(host.ProbeOutcome.ok, try real.interface().probe(.userns));
+    try std.testing.expect(no_children_left());
+}
+
+/// Forks a process that becomes `uid`:`gid` (dumpable, as a normal login is), runs the real
+/// probe there, and returns its outcome. Null if it could not be run. Needs root to drop ids.
+fn probe_as(uid: u32, gid: u32, kind: host.ProbeKind) ?host.ProbeOutcome {
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return null;
+    if (forked == 0) {
+        const no_groups = [_]linux.gid_t{};
+        var ok = linux.errno(linux.setgroups(0, &no_groups)) == .SUCCESS;
+        ok = ok and linux.errno(linux.setresgid(gid, gid, gid)) == .SUCCESS;
+        ok = ok and linux.errno(linux.setresuid(uid, uid, uid)) == .SUCCESS;
+        const dumpable = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
+        if (!ok or linux.errno(dumpable) != .SUCCESS) linux.exit_group(99);
+        var real: HostReal = .{ .probe_timeout_ms = 2000 };
+        const outcome = real.interface().probe(kind) catch linux.exit_group(98);
+        linux.exit_group(@intCast(@backingInt(outcome)));
+    }
+    var status: i32 = 0;
+    if (linux.wait4(@intCast(forked), &status, 0, null) != forked) return null;
+    const bits: u32 = @bitCast(status);
+    if (!linux.W.IFEXITED(bits)) return null;
+    const code = linux.W.EXITSTATUS(bits);
+    if (code >= std.meta.fieldNames(host.ProbeOutcome).len) return null;
+    return @fromBackingInt(@intCast(code));
+}
+
+test "the real probe works for an ordinary user whose ids are neither root nor 65534" {
+    // Goal: regression for reading getuid()/getgid() after unshare, which returns the overflow
+    // id 65534 and maps an id the caller does not own (EPERM). The old tests ran as root, which
+    // is dropped to 65534, the one id for which that bug is invisible. Method: run the real
+    // probe as uid 4242 and gid 4343 (different from each other, root and 65534). It must agree
+    // with the probe run as nobody; if this kernel refuses the probe for nobody too, skip.
+    if (linux.getuid() != 0) return error.SkipZigTest; // Dropping ids needs root.
+    const kinds = [_]host.ProbeKind{ .userns, .overlay };
+    for (kinds) |kind| {
+        const baseline = probe_as(65534, 65534, kind) orelse return error.SkipZigTest;
+        if (baseline != .ok) return error.SkipZigTest;
+        const other = probe_as(4242, 4343, kind) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(host.ProbeOutcome.ok, other);
+    }
     try std.testing.expect(no_children_left());
 }
 

@@ -85,6 +85,8 @@ pub const ProbeOutcome = enum {
     denied,
     /// Overlay only: the child could not enter the user and mount namespaces the probe needs.
     setup_denied,
+    /// The namespace was created but writing setgroups/uid_map/gid_map was refused.
+    map_denied,
     /// The child failed for a reason that says nothing about the feature (no memory, ...).
     failed,
     /// The child was killed by a signal.
@@ -192,7 +194,9 @@ pub const Host = struct {
     }
 
     pub fn seccomp_mode(host: Host) Error!u32 {
-        return host.vtable.seccomp_mode(host.context);
+        const mode = try host.vtable.seccomp_mode(host.context);
+        assert(mode <= 2); // The kernel's modes: disabled, strict, filter.
+        return mode;
     }
 
     pub fn is_terminal(host: Host, stream: Stream) bool {
@@ -200,7 +204,9 @@ pub const Host = struct {
     }
 
     pub fn uid(host: Host) u32 {
-        return host.vtable.uid(host.context);
+        const id = host.vtable.uid(host.context);
+        assert(id != std.math.maxInt(u32)); // (uid_t)-1 means "no change", never a real id.
+        return id;
     }
 
     pub fn probe(host: Host, kind: ProbeKind) Error!ProbeOutcome {

@@ -1,0 +1,6 @@
+ok   kernel  6.8.0-45-generic x86_64 (minimum 5.15)
+FAIL userns  a user namespace can be created, but writing its id map was refused — fix: the mapped id must be one this user owns; check LSM policy (AppArmor/SELinux) and dmesg
+ok   cgroup  cgroup v2, user@1000.service delegated to uid 1000: cpuset cpu io memory pids
+FAIL overlay  a user namespace can be created, but writing its id map was refused — fix: the mapped id must be one this user owns; check LSM policy (AppArmor/SELinux) and dmesg
+ok   subid  alice (uid 1000): subuid 65536 ids, subgid 65536 ids; newuidmap: setuid root, newgidmap: setuid root
+ok   seccomp  seccomp is supported (current mode: disabled for this process)

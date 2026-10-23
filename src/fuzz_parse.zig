@@ -133,79 +133,12 @@ fn ref_kernel(text: []const u8) ?parse.KernelVersion {
     return .{ .major = numbers[0], .minor = numbers[1], .patch = numbers[2] };
 }
 
-const RefCgroup = struct { path: ?[]const u8, legacy: u32 };
-
-fn ref_cgroup_path_ok(path: []const u8) bool {
-    if (path.len == 0 or path[0] != '/' or path.len > constants.cgroup_self_bytes_max) return false;
-    for (path) |byte| {
-        if (byte < 0x20 or byte == 0x7f) return false;
-    }
-    if (path.len == 1) return true;
-    if (path[path.len - 1] == '/') return false;
-    var start: usize = 1;
-    while (start <= path.len) {
-        var end = start;
-        while (end < path.len and path[end] != '/') end += 1;
-        const component = path[start..end];
-        if (component.len == 0) return false;
-        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
-        start = end + 1;
-    }
-    return true;
-}
-
-fn ref_cgroup(text: []const u8) ?RefCgroup {
-    if (text.len == 0 or text[text.len - 1] != '\n') return null;
-    var result: RefCgroup = .{ .path = null, .legacy = 0 };
-    var start: usize = 0;
-    var lines: u32 = 0;
-    while (start < text.len) {
-        const end = std.mem.indexOfScalarPos(u8, text, start, '\n').?;
-        const line = text[start..end];
-        start = end + 1;
-        lines += 1;
-        if (lines > constants.cgroup_lines_max) return null;
-        const first = std.mem.indexOfScalar(u8, line, ':') orelse return null;
-        const rest = line[first + 1 ..];
-        const second = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
-        const identifier = ref_number(line[0..first], 10) orelse return null;
-        const controllers = rest[0..second];
-        const path = rest[second + 1 ..];
-        if (!ref_cgroup_path_ok(path)) return null;
-        if (!ref_controller_names_ok(controllers)) return null;
-        if (identifier == 0) {
-            if (controllers.len != 0) return null;
-            if (result.path != null) return null;
-            result.path = path;
-        } else {
-            result.legacy += 1;
-        }
-    }
-    return result;
-}
-
-fn ref_controller_names_ok(controllers: []const u8) bool {
-    if (controllers.len == 0) return true;
-    var previous_comma = true; // A name must follow the start and every comma.
-    for (controllers) |byte| {
-        if (byte == ',') {
-            if (previous_comma) return false;
-            previous_comma = true;
-            continue;
-        }
-        const punctuation = std.mem.indexOfScalar(u8, "_=-.", byte) != null;
-        const allowed = std.ascii.isAlphanumeric(byte) or punctuation;
-        if (!allowed) return false;
-        previous_comma = false;
-    }
-    return !previous_comma;
-}
-
 const known_controllers = [_][]const u8{
     "cpuset", "cpu", "io", "memory", "hugetlb", "pids", "rdma", "misc",
 };
 
 fn ref_controllers(text: []const u8) ?struct { bits: u16, unknown: u32 } {
+    if (text.len > constants.cgroup_list_bytes_max) return null;
     var body = text;
     if (body.len > 0 and body[body.len - 1] == '\n') body = body[0 .. body.len - 1];
     var bits: u16 = 0;
@@ -365,13 +298,6 @@ const kernel_samples = [_][]const u8{
     "6.8.0-45-generic", "6.18.44-fc-v153",       "5.15.0",         "5.4.0+",
     "5.15-rc1",         "6.8.5-301.fc40.x86_64", "4.19.0-9-amd64", "5.15.0.1",
 };
-const cgroup_samples = [_][]const u8{
-    "0::/user.slice/user-1000.slice/session-3.scope\n",
-    "0::/\n",
-    "12:pids:/a\n1:name=systemd:/a\n0::/a\n",
-    "4:memory:/docker/x\n3:cpu,cpuacct:/docker/x\n",
-    "0::/a/../b\n",
-};
 const controller_samples = [_][]const u8{
     "cpuset cpu io memory hugetlb pids rdma misc\n", "cpu memory pids\n", "\n",
     "cpu future\n",                                  "pids pids\n",
@@ -410,21 +336,6 @@ pub fn fuzz_parse_kernel(seed: u64) void {
     const got = parse.parse_kernel_release(input);
     if (ref_kernel(input)) |expected| {
         assert(std.meta.eql(must(got), expected));
-    } else {
-        assert(std.meta.isError(got));
-    }
-}
-
-pub fn fuzz_parse_cgroup(seed: u64) void {
-    var prng = std.Random.Xoshiro256.init(seed);
-    var buffer: [input_bytes_max]u8 = undefined;
-    const input = make_input(prng.random(), &cgroup_samples, &buffer);
-    const got = parse.parse_cgroup_self(input);
-    if (ref_cgroup(input)) |expected| {
-        const value = must(got);
-        assert(value.legacy_hierarchies == expected.legacy);
-        assert((value.unified_path == null) == (expected.path == null));
-        if (expected.path) |path| assert(std.mem.eql(u8, value.unified_path.?, path));
     } else {
         assert(std.meta.isError(got));
     }

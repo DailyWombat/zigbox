@@ -63,11 +63,14 @@ pub fn parse(args: []const []const u8) ParseError!Command {
 
 /// Exact match only: near misses such as `Help` or `version` are unknown commands.
 fn command_named(name: []const u8) ?Command {
-    if (std.mem.eql(u8, name, "doctor")) return .doctor;
-    if (std.mem.eql(u8, name, "help")) return .help;
-    if (std.mem.eql(u8, name, "--help")) return .help;
-    if (std.mem.eql(u8, name, "--version")) return .version;
-    return null;
+    assert(name.len <= constants.arg_bytes_max); // collect() refuses longer arguments.
+    var found: ?Command = null;
+    if (std.mem.eql(u8, name, "doctor")) found = .doctor;
+    if (std.mem.eql(u8, name, "help")) found = .help;
+    if (std.mem.eql(u8, name, "--help")) found = .help;
+    if (std.mem.eql(u8, name, "--version")) found = .version;
+    if (found != null) assert(name.len > 0); // The empty string is never a command.
+    return found;
 }
 
 /// Copies the iterator's remaining arguments into fixed storage, refusing rather than

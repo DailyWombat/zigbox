@@ -31,7 +31,6 @@ const fuzzers = [_]Fuzzer{
     .{ .name = "doctor", .run_iteration = fuzz_doctor },
     .{ .name = "parse_sysctl", .run_iteration = parse_fuzz.fuzz_parse_sysctl },
     .{ .name = "parse_kernel", .run_iteration = parse_fuzz.fuzz_parse_kernel },
-    .{ .name = "parse_cgroup", .run_iteration = parse_fuzz.fuzz_parse_cgroup },
     .{ .name = "parse_controllers", .run_iteration = parse_fuzz.fuzz_parse_controllers },
     .{ .name = "parse_subid", .run_iteration = parse_fuzz.fuzz_parse_subid },
     .{ .name = "parse_passwd", .run_iteration = parse_fuzz.fuzz_parse_passwd },

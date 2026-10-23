@@ -89,6 +89,9 @@ pub const Report = struct {
     checks: [constants.doctor_checks_count]Check,
 
     pub fn exit_code(report: *const Report) u8 {
+        // The checks are always in the fixed order the renderer and the fuzzers rely on.
+        assert(report.checks[0].id == .kernel);
+        assert(report.checks[report.checks.len - 1].id == .seccomp);
         for (report.checks) |check| {
             if (check.status == .fail) return constants.exit_failed;
         }
@@ -160,9 +163,19 @@ const ProbeFact = struct {
         fact.err = null;
         fact.outcome = host.probe(kind) catch |err| {
             fact.err = err;
+            // A probe never reads a file, so it cannot report the size-limit error.
+            assert(err != error.FileTooLarge);
             return;
         };
+        assert(fact.err == null);
     }
+};
+
+/// One `stat` of a path: the result or the error.
+const StatFact = struct {
+    stat: host_mod.Stat = .{ .mode = 0, .uid = 0 },
+    err: ?host_mod.Error = null,
+    attempted: bool = false,
 };
 
 /// A candidate location of newuidmap or newgidmap.
@@ -206,9 +219,9 @@ pub const Facts = struct {
     probe_userns: ProbeFact,
 
     cgroup_root: Slot(constants.cgroup_list_bytes_max),
-    cgroup_self: Slot(constants.cgroup_self_bytes_max),
+    /// `user@UID.service` below /sys/fs/cgroup: the cgroup systemd delegates to the user.
+    cgroup_user: StatFact,
     cgroup_controllers: Slot(constants.cgroup_list_bytes_max),
-    cgroup_subtree: Slot(constants.cgroup_list_bytes_max),
 
     probe_overlay: ProbeFact,
 
@@ -232,9 +245,8 @@ pub const Facts = struct {
         facts.apparmor_restrict.reset();
         facts.probe_userns = .{};
         facts.cgroup_root.reset();
-        facts.cgroup_self.reset();
+        facts.cgroup_user = .{};
         facts.cgroup_controllers.reset();
-        facts.cgroup_subtree.reset();
         facts.probe_overlay = .{};
         facts.uid = 0;
         facts.passwd.reset();
@@ -251,6 +263,10 @@ pub const Facts = struct {
 
 pub fn gather(host: Host, facts: *Facts) void {
     for (std.enums.values(CheckId)) |id| gather_one(host, facts, id);
+    // Every check's facts were gathered, whatever the reads returned.
+    assert(facts.cgroup_user.attempted);
+    assert(facts.passwd.attempted);
+    if (facts.seccomp_err == null) assert(facts.seccomp != null);
 }
 
 /// Gathers the facts one check needs. Public so tests can attribute injected faults to checks.
@@ -262,6 +278,15 @@ pub fn gather_one(host: Host, facts: *Facts, id: CheckId) void {
         .overlay => facts.probe_overlay.run(host, .overlay),
         .subid => gather_subid(host, facts),
         .seccomp => gather_seccomp(host, facts),
+    }
+    // Each id ran its own gather step, not a neighbour's.
+    switch (id) {
+        .kernel => if (facts.uname_err == null) assert(facts.uname != null),
+        .userns => assert(facts.max_user_namespaces.attempted),
+        .cgroup => assert(facts.cgroup_user.attempted),
+        .overlay => {}, // The probe fact holds either an outcome or an error; both are valid.
+        .subid => assert(facts.subgid.attempted),
+        .seccomp => assert(facts.status.attempted),
     }
 }
 
@@ -284,42 +309,35 @@ fn gather_userns(host: Host, facts: *Facts) void {
     assert(facts.apparmor_restrict.attempted);
 }
 
-fn gather_cgroup(host: Host, facts: *Facts) void {
-    facts.cgroup_root.load(host, "/sys/fs/cgroup/cgroup.controllers");
-    facts.cgroup_self.load(host, "/proc/self/cgroup");
-    facts.cgroup_controllers.reset();
-    facts.cgroup_subtree.reset();
-    // Deriving the path to read is not policy: if /proc/self/cgroup does not yield a valid
-    // unified path there is nothing to read, and `evaluate_cgroup` reports why.
-    if (facts.cgroup_self.err != null) return;
-    const parsed = parse.parse_cgroup_self(facts.cgroup_self.text()) catch return;
-    const path = parsed.unified_path orelse return;
-    load_own_cgroup(host, facts, path);
-    assert(facts.cgroup_controllers.attempted);
-    assert(facts.cgroup_subtree.attempted);
+/// Where systemd keeps the cgroup it delegates to a user: the user manager's service cgroup.
+fn user_manager_path(buffer: []u8, uid: u32) []const u8 {
+    assert(buffer.len >= 100); // The longest path is 86 bytes plus two ten-digit uids.
+    const format = "/sys/fs/cgroup/user.slice/user-{d}.slice/user@{d}.service";
+    // Cannot fail: a u32 has at most ten digits, and the buffers passed in are far larger.
+    const path = std.fmt.bufPrint(buffer, format, .{ uid, uid }) catch unreachable;
+    assert(path.len > "/sys/fs/cgroup/".len);
+    assert(std.mem.endsWith(u8, path, ".service"));
+    return path;
 }
 
-fn load_own_cgroup(host: Host, facts: *Facts, path: []const u8) void {
-    assert(path.len > 0);
-    assert(path[0] == '/'); // The parser only returns absolute paths.
-    const names = [2][]const u8{ "cgroup.controllers", "cgroup.subtree_control" };
-    var buffer: [constants.path_bytes_max]u8 = undefined;
-    // "/" is the cgroup root itself; any other path is appended without a double slash.
-    const base = if (path.len == 1) "" else path;
-    for (names, 0..) |name, index| {
-        const full = std.fmt.bufPrint(&buffer, "/sys/fs/cgroup{s}/{s}", .{ base, name }) catch {
-            // Too long to be a real cgroup path: report it as a failed read.
-            const slot = if (index == 0) &facts.cgroup_controllers else &facts.cgroup_subtree;
-            slot.attempted = true;
-            slot.err = error.PathTooLong;
-            continue;
-        };
-        if (index == 0) {
-            facts.cgroup_controllers.load(host, full);
-        } else {
-            facts.cgroup_subtree.load(host, full);
-        }
-    }
+fn gather_cgroup(host: Host, facts: *Facts) void {
+    facts.uid = host.uid();
+    facts.cgroup_root.load(host, "/sys/fs/cgroup/cgroup.controllers");
+    facts.cgroup_controllers.reset();
+    facts.cgroup_user = .{ .attempted = true };
+    var buffer: [160]u8 = undefined;
+    const directory = user_manager_path(&buffer, facts.uid);
+    facts.cgroup_user.stat = host.stat(directory) catch |err| {
+        facts.cgroup_user.err = err;
+        return;
+    };
+    // The controllers file is only read where the directory exists; evaluate reports why not.
+    var file_buffer: [192]u8 = undefined;
+    const file = std.fmt.bufPrint(&file_buffer, "{s}/cgroup.controllers", .{directory});
+    // Cannot fail: the directory path is under 160 bytes, so the file path fits 192.
+    facts.cgroup_controllers.load(host, file catch unreachable);
+    assert(facts.cgroup_root.attempted);
+    assert(facts.cgroup_controllers.attempted);
 }
 
 fn gather_subid(host: Host, facts: *Facts) void {
@@ -355,6 +373,9 @@ fn gather_seccomp(host: Host, facts: *Facts) void {
 // ---- Evaluate ------------------------------------------------------------------------------
 
 pub fn evaluate(facts: *const Facts, report: *Report) void {
+    // The facts must have been gathered; a zero uid with no passwd attempt means they were not.
+    assert(facts.passwd.attempted);
+    assert(facts.status.attempted);
     for (std.enums.values(CheckId), 0..) |id, index| {
         const check = &report.checks[index];
         check.start(id);
@@ -371,7 +392,7 @@ pub fn evaluate(facts: *const Facts, report: *Report) void {
 }
 
 fn error_reason(err: host_mod.Error) []const u8 {
-    return switch (err) {
+    const reason: []const u8 = switch (err) {
         error.NotFound => "not found",
         error.AccessDenied => "permission denied",
         error.Interrupted => "interrupted",
@@ -385,6 +406,9 @@ fn error_reason(err: host_mod.Error) []const u8 {
         error.NoData => "no such attribute",
         error.IoFailed => "input/output error",
     };
+    assert(reason.len > 0);
+    assert(reason.len < 40); // One short phrase inside a sentence.
+    return reason;
 }
 
 /// A read that failed. `path` is shown to the user; the fix is the same for every file.
@@ -424,6 +448,7 @@ fn probe_problem(check: *Check, name: []const u8, fact: ProbeFact) void {
 fn evaluate_kernel(facts: *const Facts, check: *Check) void {
     assert(check.detail.len == 0);
     assert(check.status == .ok);
+    if (facts.uname_err == null) assert(facts.uname != null); // gather_kernel ran.
     if (facts.uname_err) |err| {
         check.problem("cannot read the kernel release: {s}", .{error_reason(err)});
         check.fix_with("retry; uname(2) failing means the process is heavily restricted", .{});
@@ -454,6 +479,8 @@ fn evaluate_kernel(facts: *const Facts, check: *Check) void {
 }
 
 fn kernel_at_least(version: parse.KernelVersion, minimum: [2]u32) bool {
+    assert(version.major <= 999_999_999); // The parser accepts at most nine digits.
+    assert(minimum[1] < 1000);
     if (version.major > minimum[0]) return true;
     if (version.major < minimum[0]) return false;
     return version.minor >= minimum[1];
@@ -508,6 +535,9 @@ fn optional_sysctl(check: *Check, slot: anytype, path: []const u8) error{Failed}
 fn evaluate_userns(facts: *const Facts, check: *Check) void {
     assert(check.detail.len == 0);
     assert(check.status == .ok);
+    assert(facts.max_user_namespaces.attempted); // gather_userns ran.
+    assert(facts.unprivileged_userns_clone.attempted);
+    assert(facts.apparmor_restrict.attempted);
     const missing = "use a kernel built with CONFIG_USER_NS=y";
     const max_path = "/proc/sys/user/max_user_namespaces";
     const clone_path = "/proc/sys/kernel/unprivileged_userns_clone";
@@ -533,6 +563,7 @@ fn userns_verdict(check: *Check, sysctls: UsernsSysctls, probe: ProbeFact) void 
         check.fix_with("sudo sysctl -w user.max_user_namespaces=15000", .{});
         return;
     }
+    assert(sysctls.max_user_namespaces != 0); // The zero case returned above.
     if (sysctls.clone == 0) {
         if (probe_ok) return restricted_but_working(check, "kernel.unprivileged_userns_clone=0");
         check.problem("kernel.unprivileged_userns_clone is 0 (unprivileged refused)", .{});
@@ -572,110 +603,123 @@ fn userns_probe_verdict(check: *Check, probe: ProbeFact) void {
         check.fix_with("check LSM policy (AppArmor/SELinux) and seccomp filters; see dmesg", .{});
         return;
     }
+    if (probe.is(.map_denied)) return map_denied(check);
+    assert(!probe.is(.ok)); // Only reached when the probe did not succeed.
     probe_problem(check, "user namespace", probe);
+}
+
+/// The namespace was created, but writing setgroups/gid_map/uid_map was refused.
+fn map_denied(check: *Check) void {
+    assert(check.status == .ok);
+    assert(check.fix.len == 0);
+    check.problem("a user namespace can be created, but writing its id map was refused", .{});
+    check.fix_with(
+        "the mapped id must be one this user owns; check LSM policy (AppArmor/SELinux) and dmesg",
+        .{},
+    );
 }
 
 // cgroup
 
 const required_controllers = [_]parse.Controller{ .cpu, .memory, .pids };
 
+const delegate_fix = "create /etc/systemd/system/user@.service.d/delegate.conf containing " ++
+    "[Service] and Delegate=cpu cpuset io memory pids, then sudo systemctl daemon-reload " ++
+    "and log in again";
+
+/// What zbx will rely on (M2 creates its scope under the systemd user manager) is the cgroup
+/// systemd delegates to the user: `user@UID.service`. It must exist, belong to the user, and
+/// offer cpu, memory and pids. The process's own cgroup (an ssh session scope, say) is not the
+/// one that matters, so /proc/self/cgroup is not consulted.
 fn evaluate_cgroup(facts: *const Facts, check: *Check) void {
     assert(check.detail.len == 0);
     assert(check.status == .ok);
-    const v1_fix = "boot with systemd.unified_cgroup_hierarchy=1, or use a cgroup v2 distribution";
+    assert(facts.cgroup_root.attempted); // gather_cgroup ran.
+    assert(facts.cgroup_user.attempted);
     if (facts.cgroup_root.err) |err| {
-        if (err == error.NotFound) {
-            check.problem(
-                "cgroup v2 is not mounted at /sys/fs/cgroup (cgroup v1 or hybrid host)",
-                .{},
-            );
-            check.fix_with("{s}", .{v1_fix});
-        } else {
-            read_failed(check, "/sys/fs/cgroup/cgroup.controllers", err);
-        }
+        const root_file = "/sys/fs/cgroup/cgroup.controllers";
+        if (err != error.NotFound) return read_failed(check, root_file, err);
+        check.problem("cgroup v2 is not mounted at /sys/fs/cgroup (cgroup v1 or hybrid host)", .{});
+        const fix = "boot with systemd.unified_cgroup_hierarchy=1 or use a cgroup v2 distro";
+        check.fix_with(fix, .{});
         return;
     }
-    if (facts.cgroup_self.err) |err| return read_failed(check, "/proc/self/cgroup", err);
-    const self = parse.parse_cgroup_self(facts.cgroup_self.text()) catch {
-        check.problem("/proc/self/cgroup is malformed", .{});
-        check.fix_with("check /proc/self/cgroup; the kernel writes ID:CONTROLLERS:PATH lines", .{});
+    var buffer: [160]u8 = undefined;
+    const directory = user_manager_path(&buffer, facts.uid);
+    if (facts.cgroup_user.err) |err| {
+        if (err != error.NotFound) return read_failed(check, directory, err);
+        check.problem("no systemd user manager for uid {d}: {s} does not exist", .{
+            facts.uid, directory,
+        });
+        check.fix_with("log in through a systemd (logind) session, or run: {s}", .{
+            "sudo loginctl enable-linger $(id -un)",
+        });
+        return;
+    }
+    if (!cgroup_owned_directory(check, facts, directory)) return;
+    if (facts.cgroup_controllers.err) |err| {
+        var file_buffer: [192]u8 = undefined;
+        // Cannot fail: the directory path is under 160 bytes, so the file path fits 192.
+        const format = "{s}/cgroup.controllers";
+        const formatted = std.fmt.bufPrint(&file_buffer, format, .{directory});
+        const file = formatted catch unreachable; // Same bound as above.
+        return read_failed(check, file, err);
+    }
+    const offered = parse.parse_controller_list(facts.cgroup_controllers.text()) catch {
+        check.problem("cgroup.controllers of the user manager is malformed", .{});
+        check.fix_with("check the file; the kernel writes space-separated lowercase names", .{});
         return;
     };
-    const path = self.unified_path orelse {
-        check.problem("this process has no cgroup v2 entry in /proc/self/cgroup", .{});
-        check.fix_with("{s}", .{v1_fix});
-        return;
-    };
-    cgroup_delegation(facts, check, path);
+    cgroup_verdict(check, facts.uid, offered);
 }
 
-fn cgroup_delegation(facts: *const Facts, check: *Check, path: []const u8) void {
-    assert(check.detail.len == 0);
+/// True if the user manager's cgroup is a directory owned by the user; otherwise reports.
+fn cgroup_owned_directory(check: *Check, facts: *const Facts, directory: []const u8) bool {
     assert(check.status == .ok);
-    assert(path.len > 0);
-    const slots = [2]*const Slot(constants.cgroup_list_bytes_max){
-        &facts.cgroup_controllers, &facts.cgroup_subtree,
-    };
-    const names = [2][]const u8{ "cgroup.controllers", "cgroup.subtree_control" };
-    var sets: [2]parse.ControllerSet = undefined;
-    for (slots, names, 0..) |slot, name, index| {
-        if (slot.err) |err| {
-            var storage: [120]u8 = undefined;
-            check.problem("cannot read {s} of cgroup {s}: {s}", .{
-                name, text_util.sanitise(&storage, path), error_reason(err),
-            });
-            check.fix_with("check that /sys/fs/cgroup{s} exists and is readable", .{
-                text_util.sanitise(&storage, path),
-            });
-            return;
-        }
-        sets[index] = parse.parse_controller_list(slot.text()) catch {
-            check.problem("{s} is malformed", .{name});
-            check.fix_with(
-                "check the file; the kernel writes space-separated lowercase names",
-                .{},
-            );
-            return;
-        };
+    assert(facts.cgroup_user.attempted);
+    assert(directory.len > 0);
+    assert(facts.cgroup_user.err == null);
+    const stat = facts.cgroup_user.stat;
+    if (stat.mode & std.posix.S.IFMT != std.posix.S.IFDIR) {
+        check.problem("{s} is not a directory", .{directory});
+        check.fix_with("{s}", .{delegate_fix});
+        return false;
     }
-    cgroup_verdict(check, path, sets[0], sets[1]);
+    if (stat.uid == facts.uid) return true;
+    check.problem("{s} is owned by uid {d}, not by uid {d}: it is not delegated to this user", .{
+        directory, stat.uid, facts.uid,
+    });
+    check.fix_with("{s}", .{delegate_fix});
+    return false;
 }
 
-fn cgroup_verdict(
-    check: *Check,
-    path: []const u8,
-    controllers: parse.ControllerSet,
-    subtree: parse.ControllerSet,
-) void {
+fn cgroup_verdict(check: *Check, uid: u32, offered: parse.ControllerSet) void {
     assert(check.detail.len == 0);
     assert(check.status == .ok);
     var missing: Detail = .{};
     for (required_controllers) |controller| {
-        if (!controllers.has(controller)) missing.print(" {s}", .{@tagName(controller)});
+        if (!offered.has(controller)) missing.print(" {s}", .{@tagName(controller)});
     }
-    var storage: [120]u8 = undefined;
-    const shown = text_util.sanitise(&storage, path);
     if (missing.len > 0) {
-        check.problem("cgroup {s} lacks controllers:{s}", .{ shown, missing.slice() });
-        check.fix_with(
-            "set Delegate=cpu memory pids in a user@.service drop-in, then log in again",
-            .{},
-        );
+        check.problem("the cgroup delegated to uid {d} lacks controllers:{s}", .{
+            uid, missing.slice(),
+        });
+        check.fix_with("{s}", .{delegate_fix});
         return;
     }
-    check.detail.print("cgroup v2 {s}, delegated:", .{shown});
-    append_controllers(&check.detail, controllers);
-    check.detail.print("; enabled for children:", .{});
-    append_controllers(&check.detail, subtree);
+    check.detail.print("cgroup v2, user@{d}.service delegated to uid {d}:", .{ uid, uid });
+    append_controllers(&check.detail, offered);
     check.status = .ok;
 }
 
 fn append_controllers(detail: *Detail, set: parse.ControllerSet) void {
+    assert(detail.len > 0); // Called after the sentence it extends.
     if (set.is_empty()) detail.print(" none", .{});
     for (std.enums.values(parse.Controller)) |controller| {
         if (set.has(controller)) detail.print(" {s}", .{@tagName(controller)});
     }
     if (set.unknown > 0) detail.print(" +{d} other", .{set.unknown});
+    if (detail.truncated) assert(detail.len == constants.detail_bytes_max);
 }
 
 // overlay
@@ -696,11 +740,14 @@ fn evaluate_overlay(facts: *const Facts, check: *Check) void {
         );
         return;
     }
+    if (probe.is(.map_denied)) return map_denied(check);
     if (probe.is(.setup_denied)) {
         check.problem("could not enter the user and mount namespaces the probe needs", .{});
         check.fix_with("fix the userns check first; overlay needs the same permission", .{});
         return;
     }
+    assert(!probe.is(.ok)); // Every success and named refusal returned above.
+    if (probe.err == null) assert(probe.outcome != .denied);
     probe_problem(check, "overlay", probe);
 }
 
@@ -730,7 +777,11 @@ fn binary_state(facts: *const Facts, program: Program) BinaryState {
     }
     var found_unprivileged = false;
     for (row) |*binary| {
-        if (binary.stat_err != null) continue; // Only NotFound can be left here.
+        if (binary.stat_err) |err| {
+            assert(err == error.NotFound); // The fault scan above returned any other.
+            continue;
+        }
+        if (binary.capability_err) |err| assert(err == error.NoData);
         const privilege = candidate_privilege(binary, program);
         if (privilege) |by_setuid| return .{ .privileged = by_setuid };
         found_unprivileged = true;
@@ -740,6 +791,8 @@ fn binary_state(facts: *const Facts, program: Program) BinaryState {
 
 /// null if the candidate is not privileged; otherwise whether it is by setuid root.
 fn candidate_privilege(binary: *const Binary, program: Program) ?bool {
+    assert(binary.stat_err == null); // Only called for candidates that exist.
+    assert(binary.capability_len <= constants.capability_bytes_max);
     const regular = binary.stat.mode & std.posix.S.IFMT == std.posix.S.IFREG;
     if (!regular) return null;
     const setuid_bit = binary.stat.mode & 0o4000 != 0;
@@ -758,6 +811,8 @@ fn candidate_privilege(binary: *const Binary, program: Program) ?bool {
 fn evaluate_subid(facts: *const Facts, check: *Check) void {
     assert(check.detail.len == 0);
     assert(check.status == .ok);
+    assert(facts.subuid.attempted); // gather_subid ran.
+    assert(facts.subgid.attempted);
     // Failed reads come first: a fault must never be answered from partial information.
     if (facts.passwd.err) |err| {
         if (err != error.NotFound) return read_failed(check, "/etc/passwd", err);
@@ -787,18 +842,22 @@ const UserLookup = struct {
 };
 
 fn lookup_user(facts: *const Facts) UserLookup {
+    assert(facts.passwd.attempted);
     if (facts.passwd.err != null) return .{ .name = null, .passwd_present = false };
     const found = parse.parse_passwd_name(facts.passwd.text(), facts.uid);
+    if (found.name) |name| assert(name.len > 0);
     return .{ .name = found.name, .passwd_present = true };
 }
 
 fn user_label(user: UserLookup, uid: u32, buffer: *Detail) void {
+    assert(buffer.len == 0);
     if (user.name) |name| {
         var storage: [constants.user_name_bytes_max]u8 = undefined;
         buffer.print("{s} (uid {d})", .{ text_util.sanitise(&storage, name), uid });
     } else {
         buffer.print("uid {d} (no passwd entry, matched by uid only)", .{uid});
     }
+    assert(buffer.len > 0);
 }
 
 /// What is wrong with the subid setup, collected so that one run names every problem.
@@ -835,6 +894,7 @@ fn subid_verdict(
     }
     var who: Detail = .{};
     user_label(user, facts.uid, &who);
+    assert(who.len > 0);
     var problems: SubidProblems = .{};
     var found: Detail = .{};
     const kinds = [2][]const u8{ "subuid", "subgid" };
@@ -907,6 +967,8 @@ fn subid_fixes(check: *Check, user: UserLookup, problems: SubidProblems) void {
 fn evaluate_seccomp(facts: *const Facts, check: *Check) void {
     assert(check.detail.len == 0);
     assert(check.status == .ok);
+    assert(facts.status.attempted); // gather_seccomp ran.
+    if (facts.seccomp_err == null) assert(facts.seccomp != null);
     if (facts.status.err) |err| return read_failed(check, "/proc/self/status", err);
     if (facts.seccomp_err) |err| {
         check.problem("prctl(PR_GET_SECCOMP) failed: {s}", .{error_reason(err)});
@@ -942,22 +1004,30 @@ const Style = struct {
 };
 
 fn style_of(status: Status) Style {
-    return switch (status) {
+    const style: Style = switch (status) {
         .ok => .{ .label = "ok  ", .color = "\x1b[32m" },
         .fail => .{ .label = "FAIL", .color = "\x1b[31m" },
         .warn => .{ .label = "warn", .color = "\x1b[33m" },
     };
+    assert(style.label.len == 4); // The columns after the label line up.
+    return style;
 }
 
 /// Renders the report, one line per check. Colour only when asked (stdout is a terminal).
 pub fn render(report: *const Report, color: bool, buffer: []u8) []const u8 {
+    assert(buffer.len > 0);
     report.validate();
     var writer = std.Io.Writer.fixed(buffer);
     for (report.checks) |check| render_line(&writer, check, color);
-    return writer.buffered();
+    const output = writer.buffered();
+    assert(output.len > 0);
+    assert(output[output.len - 1] == '\n');
+    return output;
 }
 
 fn render_line(writer: *std.Io.Writer, check: Check, color: bool) void {
+    assert(check.detail.len > 0);
+    if (check.status == .fail) assert(check.fix.len > 0);
     const style = style_of(check.status);
     // Cannot fail: constants.zig asserts, at comptime, that six maximal lines fit the buffer.
     if (color) writer.writeAll(style.color) catch unreachable;
@@ -985,6 +1055,7 @@ pub fn run(host: Host) u8 {
     const output = render(&report, host.is_terminal(.stdout), &buffer);
     assert(output.len > 0);
     host.write_all(.stdout, output) catch return constants.exit_failed;
+    assert(output.len <= buffer.len);
     return report.exit_code();
 }
 
@@ -1025,7 +1096,7 @@ test "the healthy fixtures pass and warn does not change the exit code" {
         "ubuntu_2404",                    "fedora_40",
         "restricted_but_working",         "subid_by_uid",
         "no_passwd_entry",                "kernel_exactly_minimum",
-        "kernel_newer_major_lower_minor", "cgroup_root_path",
+        "kernel_newer_major_lower_minor",
     };
     var target: HostSim = undefined;
     for (fixtures.all) |fixture| {
@@ -1037,22 +1108,29 @@ test "the healthy fixtures pass and warn does not change the exit code" {
     }
 }
 
-test "uid 0 gets no free pass: a root user on a healthy host still fails subid" {
-    // Goal: root is judged like anyone else. Method: the healthy Ubuntu fixture, run as uid 0
-    // (no subuid entry for root), must fail subid and only subid.
+test "uid 0 gets no free pass: root is judged like anyone else" {
+    // Goal: a root user on a healthy host still fails subid (root has no subuid range), and
+    // without a user manager it also fails cgroup. Method: gather and evaluate, then compare the
+    // status of every check.
+    const cases = [_]struct { name: []const u8, failing: []const CheckId }{
+        .{ .name = "ubuntu_2404_as_root", .failing = &.{.subid} },
+        .{ .name = "ubuntu_2404_as_root_no_manager", .failing = &.{ .cgroup, .subid } },
+    };
     var target: HostSim = undefined;
     var facts: Facts = undefined;
     var report: Report = undefined;
-    for (fixtures.all) |fixture| {
-        if (!std.mem.eql(u8, fixture.name, "ubuntu_2404_as_root")) continue;
-        target.init(1, fixture.files);
-        fixture.apply(&target);
-        facts.reset();
-        gather(target.interface(), &facts);
-        evaluate(&facts, &report);
-        for (report.checks) |check| {
-            const expected: Status = if (check.id == .subid) .fail else .ok;
-            try testing.expectEqual(expected, check.status);
+    for (cases) |case| {
+        for (fixtures.all) |fixture| {
+            if (!std.mem.eql(u8, fixture.name, case.name)) continue;
+            target.init(1, fixture.files);
+            fixture.apply(&target);
+            facts.reset();
+            gather(target.interface(), &facts);
+            evaluate(&facts, &report);
+            for (report.checks) |check| {
+                const listed = std.mem.indexOfScalar(CheckId, case.failing, check.id) != null;
+                try testing.expectEqual(if (listed) Status.fail else Status.ok, check.status);
+            }
         }
     }
 }

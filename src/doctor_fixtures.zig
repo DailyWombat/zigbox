@@ -25,11 +25,12 @@ pub const Spec = struct {
     unprivileged_userns_clone: ?[]const u8 = null,
     apparmor_restrict: ?[]const u8 = "0\n",
     cgroup_root: ?[]const u8 = "cpuset cpu io memory hugetlb pids rdma misc\n",
-    cgroup_self: ?[]const u8 = "0::/user.slice/user-1000.slice/user@1000.service/app.slice\n",
-    /// Where `cgroup.controllers` lives for this process (below /sys/fs/cgroup).
-    cgroup_path: []const u8 = "/user.slice/user-1000.slice/user@1000.service/app.slice",
-    cgroup_controllers: ?[]const u8 = "cpu memory pids\n",
-    cgroup_subtree: ?[]const u8 = "cpu memory pids\n",
+    /// The user manager's cgroup directory (user@UID.service): whether it exists, its mode,
+    /// and its owner (null means the fixture's user).
+    cgroup_user: bool = true,
+    cgroup_user_mode: u32 = 0o040755,
+    cgroup_user_owner: ?u32 = null,
+    cgroup_controllers: ?[]const u8 = "cpuset cpu io memory pids\n",
     passwd: ?[]const u8 =
         "root:x:0:0:root:/root:/bin/bash\n" ++
         "alice:x:1000:1000:Alice,,,:/home/alice:/bin/bash\n",
@@ -103,9 +104,17 @@ pub fn build(comptime spec: Spec) Fixture {
         list.add("/proc/sys/kernel/unprivileged_userns_clone", spec.unprivileged_userns_clone);
         list.add("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", spec.apparmor_restrict);
         list.add(root ++ "/cgroup.controllers", spec.cgroup_root);
-        list.add("/proc/self/cgroup", spec.cgroup_self);
-        list.add(root ++ spec.cgroup_path ++ "/cgroup.controllers", spec.cgroup_controllers);
-        list.add(root ++ spec.cgroup_path ++ "/cgroup.subtree_control", spec.cgroup_subtree);
+        const directory = std.fmt.comptimePrint(
+            root ++ "/user.slice/user-{d}.slice/user@{d}.service",
+            .{ spec.uid, spec.uid },
+        );
+        if (spec.cgroup_user) {
+            list.add_binary(directory, .{
+                .mode = spec.cgroup_user_mode,
+                .uid = spec.cgroup_user_owner orelse spec.uid,
+            });
+        }
+        list.add(directory ++ "/cgroup.controllers", spec.cgroup_controllers);
         list.add("/etc/passwd", spec.passwd);
         list.add("/etc/subuid", spec.subuid);
         list.add("/etc/subgid", spec.subgid);
@@ -139,12 +148,6 @@ const cap_setgid_ep = "\x01\x00\x00\x02\x40\x00\x00\x00" ++ zero_pairs;
 const cap_setuid_namespaced =
     "\x01\x00\x00\x03\x80\x00\x00\x00" ++ zero_pairs ++ "\xe8\x03\x00\x00";
 
-const fedora_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/app-term.scope";
-
-const container_cgroup =
-    "9:name=systemd:/\n8:pids:/\n7:blkio:/\n6:freezer:/\n5:devices:/\n" ++
-    "4:memory:/process_api/job/bash\n3:cpuset:/\n2:cpuacct:/\n1:cpu:/\n0::/\n";
-
 pub const all = [_]Fixture{
     build(.{ .name = "ubuntu_2404" }),
     // Ubuntu 24.04 as installed: the AppArmor restriction is on, so the probe is refused.
@@ -157,10 +160,7 @@ pub const all = [_]Fixture{
         .name = "fedora_40",
         .kernel = "6.8.5-301.fc40.x86_64",
         .apparmor_restrict = null,
-        .cgroup_self = "0::" ++ fedora_cgroup ++ "\n",
-        .cgroup_path = fedora_cgroup,
         .cgroup_controllers = "cpu memory pids\n",
-        .cgroup_subtree = "\n",
         .subuid = "alice:524288:65536\n",
         .subgid = "alice:524288:65536\n",
         .newuidmap = .{ .mode = 0o100755, .capability = cap_setuid_ep },
@@ -176,10 +176,8 @@ pub const all = [_]Fixture{
         .apparmor_restrict = null,
         .max_user_namespaces = "64280\n",
         .cgroup_root = null,
-        .cgroup_self = container_cgroup,
-        .cgroup_path = "/",
+        .cgroup_user = false,
         .cgroup_controllers = null,
-        .cgroup_subtree = null,
         .passwd = "root:x:0:0:root:/root:/bin/bash\nubuntu:x:1000:1000::/home/ubuntu:/bin/bash\n",
         .subuid = "ubuntu:100000:65536\n",
         .subgid = "ubuntu:100000:65536\n",
@@ -190,9 +188,9 @@ pub const all = [_]Fixture{
     build(.{
         .name = "ubuntu_2404_as_root",
         .uid = 0,
-        .cgroup_self = "0::/system.slice/ssh.service\n",
-        .cgroup_path = "/system.slice/ssh.service",
     }),
+    // Root without a user manager (the usual case: root has no logind user session).
+    build(.{ .name = "ubuntu_2404_as_root_no_manager", .uid = 0, .cgroup_user = false }),
     build(.{
         .name = "userns_disabled",
         .max_user_namespaces = "0\n",
@@ -214,12 +212,20 @@ pub const all = [_]Fixture{
     build(.{ .name = "restricted_but_working", .apparmor_restrict = "1\n" }),
     build(.{ .name = "old_kernel", .kernel = "5.4.0-150-generic" }),
     build(.{ .name = "odd_kernel", .kernel = "banana" }),
+    // The delegated cgroup offers io and cpuset but not cpu or memory.
+    build(.{ .name = "cgroup_missing_controllers", .cgroup_controllers = "cpuset io pids\n" }),
+    // Only cpu is missing: systemd does not delegate cpu by default on some releases.
+    build(.{ .name = "cgroup_cpu_missing", .cgroup_controllers = "cpuset io memory pids\n" }),
+    build(.{ .name = "cgroup_user_manager_missing", .cgroup_user = false }),
+    build(.{ .name = "cgroup_dir_not_owned", .cgroup_user_owner = 0 }),
+    build(.{ .name = "cgroup_not_a_directory", .cgroup_user_mode = 0o100644 }),
+    // The directory exists but its controllers file cannot be found.
+    build(.{ .name = "cgroup_controllers_file_missing", .cgroup_controllers = null }),
+    build(.{ .name = "cgroup_controllers_malformed", .cgroup_controllers = "cpu  memory\n" }),
     build(.{
-        .name = "cgroup_missing_controllers",
-        .cgroup_controllers = "cpuset cpu io\n",
-        .cgroup_subtree = "\n",
+        .name = "userns_map_denied",
+        .probes = .{ .userns = .map_denied, .overlay = .map_denied },
     }),
-    build(.{ .name = "cgroup_missing_dir", .cgroup_controllers = null, .cgroup_subtree = null }),
     build(.{ .name = "overlay_denied", .probes = .{ .overlay = .denied } }),
     build(.{ .name = "probe_timeout", .probes = .{ .userns = .timed_out, .overlay = .timed_out } }),
     build(.{ .name = "probe_signaled", .probes = .{ .userns = .signaled, .overlay = .signaled } }),
@@ -257,13 +263,6 @@ pub const all = [_]Fixture{
     build(.{ .name = "kernel_exactly_minimum", .kernel = "5.15.0" }),
     build(.{ .name = "kernel_just_below", .kernel = "5.14.21-generic" }),
     build(.{ .name = "kernel_newer_major_lower_minor", .kernel = "6.0.1" }),
-    // A process in the root cgroup: the path is "/" and files live directly in /sys/fs/cgroup.
-    build(.{
-        .name = "cgroup_root_path",
-        .cgroup_self = "0::/\n",
-        .cgroup_path = "",
-        .cgroup_controllers = null,
-    }),
 };
 
 test "every fixture has a distinct name and fits the simulator" {

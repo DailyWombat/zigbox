@@ -51,9 +51,7 @@ pub const probe_reap_polls_max: u32 = 2000;
 
 // Doctor: one buffer size per file read, sized from what the kernel can actually produce.
 pub const sysctl_bytes_max: u32 = 32;
-pub const cgroup_self_bytes_max: u32 = 4096;
 pub const cgroup_list_bytes_max: u32 = 512;
-pub const cgroup_lines_max: u32 = 64;
 pub const passwd_bytes_max: u32 = 64 * 1024;
 pub const subid_bytes_max: u32 = 64 * 1024;
 pub const status_bytes_max: u32 = 16 * 1024;
@@ -115,7 +113,6 @@ comptime {
     assert(probe_reap_polls_max > 0);
 
     assert(sysctl_bytes_max >= 12); // "4294967295\n" is 11 bytes.
-    assert(cgroup_self_bytes_max <= file_bytes_max);
     assert(cgroup_list_bytes_max <= file_bytes_max);
     assert(passwd_bytes_max <= file_bytes_max);
     assert(subid_bytes_max <= file_bytes_max);
