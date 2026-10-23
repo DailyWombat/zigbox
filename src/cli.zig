@@ -9,6 +9,8 @@ const assert = std.debug.assert;
 const build_options = @import("build_options");
 const constants = @import("constants.zig");
 const host_mod = @import("host.zig");
+const doctor = @import("doctor.zig");
+const text_util = @import("text.zig");
 
 const Host = host_mod.Host;
 
@@ -26,16 +28,12 @@ const help_text =
 
 const version_text = "zbx " ++ build_options.version ++ "\n";
 
-const doctor_stub_text = "zbx: doctor is not implemented in this slice\n";
-
 comptime {
     // Fixed messages must fit the one buffer every message is rendered into.
     assert(help_text.len < constants.output_bytes_max);
     assert(version_text.len < constants.output_bytes_max);
-    assert(doctor_stub_text.len < constants.output_bytes_max);
     assert(help_text[help_text.len - 1] == '\n');
     assert(version_text[version_text.len - 1] == '\n');
-    assert(doctor_stub_text[doctor_stub_text.len - 1] == '\n');
 }
 
 pub const Command = enum { doctor, help, version };
@@ -114,7 +112,7 @@ pub fn run(host: Host, args: []const []const u8) u8 {
     switch (command) {
         .help => return emit(host, .stdout, help_text, constants.exit_ok),
         .version => return emit(host, .stdout, version_text, constants.exit_ok),
-        .doctor => return emit(host, .stderr, doctor_stub_text, constants.exit_failed),
+        .doctor => return doctor.run(host),
     }
 }
 
@@ -133,12 +131,12 @@ fn report_parse_error(host: Host, err: ParseError, args: []const []const u8) u8 
             writer.writeAll("zbx: missing command; run 'zbx help'\n") catch unreachable;
         },
         error.UnknownCommand => {
-            const echo = sanitise(&echo_storage, args[0]);
+            const echo = text_util.sanitise(&echo_storage, args[0]);
             const format = "zbx: unknown command '{s}'; run 'zbx help'\n";
             writer.print(format, .{echo}) catch unreachable; // Cannot fail: see above.
         },
         error.UnexpectedArgument => {
-            const echo = sanitise(&echo_storage, args[0]);
+            const echo = text_util.sanitise(&echo_storage, args[0]);
             const format = "zbx: '{s}' takes no arguments\n";
             writer.print(format, .{echo}) catch unreachable; // Cannot fail: see above.
         },
@@ -163,33 +161,6 @@ fn emit(host: Host, stream: host_mod.Stream, text: []const u8, exit_code: u8) u8
     assert(exit_code <= constants.exit_usage);
     host.write_all(stream, text) catch return constants.exit_failed;
     return exit_code;
-}
-
-fn is_printable(byte: u8) bool {
-    if (byte < 0x20) return false;
-    if (byte >= 0x7f) return false;
-    return true;
-}
-
-/// Makes an untrusted argument safe to print: non-printable and non-ASCII bytes (which could
-/// carry terminal escape sequences) become '?', and over-long text ends in "...".
-fn sanitise(storage: *[constants.arg_echo_bytes_max]u8, argument: []const u8) []const u8 {
-    assert(storage.len == constants.arg_echo_bytes_max);
-    const marker = "...";
-    const truncated = argument.len > storage.len;
-    const keep = if (truncated) storage.len - marker.len else argument.len;
-    for (argument[0..keep], storage[0..keep]) |byte, *out| {
-        out.* = if (is_printable(byte)) byte else '?';
-    }
-    var result: []const u8 = storage[0..keep];
-    if (truncated) {
-        @memcpy(storage[keep..][0..marker.len], marker);
-        assert(keep + marker.len == storage.len);
-        result = storage[0..];
-    }
-    // Negative space: nothing printable-unsafe survives.
-    for (result) |byte| assert(is_printable(byte));
-    return result;
 }
 
 const testing = std.testing;
@@ -256,12 +227,13 @@ test "snapshot: missing command and extra arguments are one stderr line, exit 2"
     try testing.expectEqual(@as(u8, 2), try run_case(&sim, &.{ "zbx", "" }));
 }
 
-test "snapshot: doctor stub says so and exits 1" {
-    // Goal: until slice 2, doctor never reports ok. Exit 1 and a clear one-line reason.
+test "snapshot: doctor on a host with nothing readable fails every check, exit 1" {
+    // Goal: faults and absences are FAIL with a reason, never ok. The simulator here has no
+    // files at all, so every check must fail; the whole report is checked in.
     var sim: HostSim = undefined;
     try testing.expectEqual(@as(u8, 1), try run_case(&sim, &.{ "zbx", "doctor" }));
-    try testing.expectEqualStrings(@embedFile("testdata/doctor.stderr.txt"), sim.stderr());
-    try testing.expectEqual(@as(usize, 0), sim.stdout().len);
+    try testing.expectEqualStrings(@embedFile("testdata/doctor/empty_host.txt"), sim.stdout());
+    try testing.expectEqual(@as(usize, 0), sim.stderr().len);
 }
 
 test "an echoed argument cannot inject terminal escapes or overflow the line" {

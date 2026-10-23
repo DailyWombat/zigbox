@@ -16,6 +16,9 @@ pub const File = struct {
     path: []const u8,
     content: []const u8,
     mode: u32 = 0o100644,
+    uid: u32 = 0,
+    /// The raw `security.capability` xattr, if the file has one.
+    capability: ?[]const u8 = null,
     /// False models a file that exists but cannot be opened (EACCES).
     readable: bool = true,
 };
@@ -35,9 +38,12 @@ pub const Faults = struct {
     fail_call_error: host.Error = error.IoFailed,
 };
 
+/// What each probe answers. An error models a probe that could not run at all (fork failed).
 pub const Probes = struct {
     userns: host.ProbeOutcome = .ok,
     overlay: host.ProbeOutcome = .ok,
+    userns_error: ?host.Error = null,
+    overlay_error: ?host.Error = null,
 };
 
 const OpenFile = struct {
@@ -51,6 +57,16 @@ pub const HostSim = struct {
     files: []const File,
     uname_value: host.Uname,
     probes: Probes,
+    /// The real user id of the simulated process.
+    uid_value: u32,
+    /// Result of prctl(PR_GET_SECCOMP).
+    seccomp_result: host.Error!u32,
+    terminal: bool,
+    /// Error results injected so far, split so tests can reason about what surfaced: `hard`
+    /// errors (anything but EINTR) always reach the caller; interrupts may be absorbed by the
+    /// retry loop. Short reads and writes are not errors and are not counted.
+    hard_errors_injected: u32,
+    interrupts_injected: u32,
     open_files: [constants.sim_open_files_max]?OpenFile,
     call_count: u32,
     stdout_buffer: [constants.sim_output_bytes_max]u8,
@@ -70,6 +86,11 @@ pub const HostSim = struct {
             .machine = host.Text.from_slice("x86_64"),
         };
         sim.probes = .{};
+        sim.uid_value = 1000;
+        sim.seccomp_result = 2;
+        sim.terminal = false;
+        sim.hard_errors_injected = 0;
+        sim.interrupts_injected = 0;
         sim.open_files = @splat(null);
         sim.call_count = 0;
         sim.stdout_len = 0;
@@ -109,7 +130,11 @@ pub const HostSim = struct {
         .close = close,
         .write = write,
         .uname = uname,
-        .stat_mode = stat_mode,
+        .stat = stat,
+        .read_capability = read_capability,
+        .seccomp_mode = seccomp_mode,
+        .is_terminal = is_terminal,
+        .uid = uid,
         .probe = probe,
     };
 
@@ -126,8 +151,18 @@ pub const HostSim = struct {
         assert(index < std.math.maxInt(u32));
         sim.call_count += 1;
         if (sim.faults.fail_call_index) |fail_index| {
-            if (fail_index == index) return sim.faults.fail_call_error;
+            if (fail_index == index) return sim.inject(sim.faults.fail_call_error);
         }
+    }
+
+    /// Records an injected error result and returns it.
+    fn inject(sim: *HostSim, err: host.Error) host.Error {
+        if (err == error.Interrupted) {
+            sim.interrupts_injected += 1;
+        } else {
+            sim.hard_errors_injected += 1;
+        }
+        return err;
     }
 
     fn roll(sim: *HostSim, per_mille: u16) bool {
@@ -151,8 +186,8 @@ pub const HostSim = struct {
         assert(path.len > 0);
         assert(path[path.len] == 0);
         try sim.begin_call();
-        if (sim.roll(sim.faults.interrupt_per_mille)) return error.Interrupted;
-        if (sim.roll(sim.faults.open_error_per_mille)) return sim.random_error();
+        if (sim.roll(sim.faults.interrupt_per_mille)) return sim.inject(error.Interrupted);
+        if (sim.roll(sim.faults.open_error_per_mille)) return sim.inject(sim.random_error());
 
         for (sim.files, 0..) |file, file_index| {
             if (!std.mem.eql(u8, file.path, path)) continue;
@@ -173,15 +208,16 @@ pub const HostSim = struct {
         assert(handle < constants.sim_open_files_max);
         const open_file = &(sim.open_files[handle] orelse unreachable); // Pair with close().
         try sim.begin_call();
-        if (sim.roll(sim.faults.interrupt_per_mille)) return error.Interrupted;
-        if (sim.roll(sim.faults.read_error_per_mille)) return sim.random_error();
+        if (sim.roll(sim.faults.interrupt_per_mille)) return sim.inject(error.Interrupted);
+        if (sim.roll(sim.faults.read_error_per_mille)) return sim.inject(sim.random_error());
 
         const content = sim.files[open_file.file_index].content;
         assert(open_file.offset <= content.len);
         const remaining: u32 = @intCast(content.len - open_file.offset);
         var count: u32 = @min(remaining, @as(u32, @intCast(buffer.len)));
-        if (sim.roll(sim.faults.short_read_per_mille) and count > 1) {
-            count = sim.prng.random().intRangeAtMost(u32, 1, count - 1);
+        const short = sim.roll(sim.faults.short_read_per_mille);
+        if (short) {
+            if (count > 1) count = sim.prng.random().intRangeAtMost(u32, 1, count - 1);
         }
         const start = open_file.offset;
         @memcpy(buffer[0..count], content[start..][0..count]);
@@ -201,12 +237,13 @@ pub const HostSim = struct {
         const sim = from_context(context);
         assert(bytes.len > 0);
         try sim.begin_call();
-        if (sim.roll(sim.faults.interrupt_per_mille)) return error.Interrupted;
-        if (sim.roll(sim.faults.write_error_per_mille)) return error.NoSpace;
+        if (sim.roll(sim.faults.interrupt_per_mille)) return sim.inject(error.Interrupted);
+        if (sim.roll(sim.faults.write_error_per_mille)) return sim.inject(error.NoSpace);
 
         var count: u32 = @intCast(bytes.len);
-        if (sim.roll(sim.faults.short_write_per_mille) and count > 1) {
-            count = sim.prng.random().intRangeAtMost(u32, 1, count - 1);
+        const short = sim.roll(sim.faults.short_write_per_mille);
+        if (short) {
+            if (count > 1) count = sim.prng.random().intRangeAtMost(u32, 1, count - 1);
         }
         assert(count > 0);
         assert(count <= bytes.len);
@@ -228,30 +265,78 @@ pub const HostSim = struct {
         return sim.uname_value;
     }
 
-    fn stat_mode(context: *anyopaque, path: [:0]const u8) host.Error!u32 {
+    fn find(sim: *const HostSim, path: []const u8) ?*const File {
+        for (sim.files) |*file| {
+            if (std.mem.eql(u8, file.path, path)) return file;
+        }
+        return null;
+    }
+
+    fn stat(context: *anyopaque, path: [:0]const u8) host.Error!host.Stat {
         const sim = from_context(context);
         assert(path.len > 0);
         try sim.begin_call();
-        for (sim.files) |file| {
-            if (std.mem.eql(u8, file.path, path)) return file.mode;
-        }
-        return error.NotFound;
+        if (sim.roll(sim.faults.open_error_per_mille)) return sim.inject(sim.random_error());
+        const file = sim.find(path) orelse return error.NotFound;
+        return .{ .mode = file.mode, .uid = file.uid };
+    }
+
+    fn read_capability(
+        context: *anyopaque,
+        path: [:0]const u8,
+        buffer: []u8,
+    ) host.Error!u32 {
+        const sim = from_context(context);
+        assert(path.len > 0);
+        assert(buffer.len > 0);
+        try sim.begin_call();
+        if (sim.roll(sim.faults.read_error_per_mille)) return sim.inject(sim.random_error());
+        const file = sim.find(path) orelse return error.NotFound;
+        const value = file.capability orelse return error.NoData;
+        if (value.len > buffer.len) return error.FileTooLarge;
+        @memcpy(buffer[0..value.len], value);
+        return @intCast(value.len);
+    }
+
+    fn seccomp_mode(context: *anyopaque) host.Error!u32 {
+        const sim = from_context(context);
+        try sim.begin_call();
+        if (sim.roll(sim.faults.read_error_per_mille)) return sim.inject(sim.random_error());
+        return sim.seccomp_result;
+    }
+
+    fn is_terminal(context: *anyopaque, stream: host.Stream) bool {
+        const sim = from_context(context);
+        _ = stream;
+        return sim.terminal;
+    }
+
+    fn uid(context: *anyopaque) u32 {
+        return from_context(context).uid_value;
     }
 
     fn probe(context: *anyopaque, kind: host.ProbeKind) host.Error!host.ProbeOutcome {
         const sim = from_context(context);
         try sim.begin_call();
-        return switch (kind) {
-            .userns => sim.probes.userns,
-            .overlay => sim.probes.overlay,
-        };
+        if (sim.roll(sim.faults.open_error_per_mille)) return sim.inject(sim.random_error());
+        switch (kind) {
+            .userns => {
+                if (sim.probes.userns_error) |err| return err;
+                return sim.probes.userns;
+            },
+            .overlay => {
+                if (sim.probes.overlay_error) |err| return err;
+                return sim.probes.overlay;
+            },
+        }
     }
 };
 
 const fixture_files = [_]File{
     .{ .path = "/proc/sys/user/max_user_namespaces", .content = "15000\n" },
     .{ .path = "/etc/shadow", .content = "secret", .readable = false },
-    .{ .path = "/sys/fs/cgroup", .content = "", .mode = 0o040755 },
+    .{ .path = "/sys/fs/cgroup", .content = "", .mode = 0o040755, .uid = 7 },
+    .{ .path = "/with_cap", .content = "", .capability = "\x01\x02" },
 };
 
 test "sim serves a file, a missing file and an unreadable file" {
@@ -373,15 +458,28 @@ test "write_all reassembles short writes and reports a full sink" {
     try std.testing.expectError(error.NoSpace, sim.interface().write_all(.stdout, "abc"));
 }
 
-test "uname, stat_mode and probe answer from the model" {
+test "uname, stat, capability, seccomp and probe answer from the model" {
     // Goal: the remaining vtable entries return what the fixture says, and absent paths fail.
     var sim: HostSim = undefined;
     sim.init(8, &fixture_files);
     sim.probes.userns = .denied;
     const subject = sim.interface();
     try std.testing.expectEqualStrings("6.8.0-sim", (try subject.uname()).release.slice());
-    try std.testing.expectEqual(@as(u32, 0o040755), try subject.stat_mode("/sys/fs/cgroup"));
-    try std.testing.expectError(error.NotFound, subject.stat_mode("/missing"));
+    const directory = try subject.stat("/sys/fs/cgroup");
+    try std.testing.expectEqual(@as(u32, 0o040755), directory.mode);
+    try std.testing.expectEqual(@as(u32, 7), directory.uid);
+    try std.testing.expectError(error.NotFound, subject.stat("/missing"));
+
+    var buffer: [constants.capability_bytes_max]u8 = undefined;
+    const value = try subject.read_capability("/with_cap", &buffer);
+    try std.testing.expectEqualStrings("\x01\x02", value);
+    try std.testing.expectError(error.NoData, subject.read_capability("/etc/shadow", &buffer));
+    try std.testing.expectError(error.NotFound, subject.read_capability("/missing", &buffer));
+    var tiny: [1]u8 = undefined;
+    try std.testing.expectError(error.FileTooLarge, subject.read_capability("/with_cap", &tiny));
+    try std.testing.expectEqual(@as(u32, 2), try subject.seccomp_mode());
+    try std.testing.expectEqual(@as(u32, 1000), subject.uid());
+    try std.testing.expect(!subject.is_terminal(.stdout));
     try std.testing.expectEqual(host.ProbeOutcome.denied, try subject.probe(.userns));
     try std.testing.expectEqual(host.ProbeOutcome.ok, try subject.probe(.overlay));
 }

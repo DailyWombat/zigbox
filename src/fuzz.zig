@@ -10,6 +10,10 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const host = @import("host.zig");
 const cli = @import("cli.zig");
+const doctor = @import("doctor.zig");
+const fixtures = @import("doctor_fixtures.zig");
+const parse_fuzz = @import("fuzz_parse.zig");
+const text_util = @import("text.zig");
 const HostSim = @import("host_sim.zig").HostSim;
 const sim_file = @import("host_sim.zig").File;
 const Faults = @import("host_sim.zig").Faults;
@@ -23,6 +27,16 @@ const fuzzers = [_]Fuzzer{
     .{ .name = "host_read", .run_iteration = fuzz_host_read },
     .{ .name = "host_write", .run_iteration = fuzz_host_write },
     .{ .name = "cli", .run_iteration = fuzz_cli },
+    .{ .name = "text", .run_iteration = fuzz_text },
+    .{ .name = "doctor", .run_iteration = fuzz_doctor },
+    .{ .name = "parse_sysctl", .run_iteration = parse_fuzz.fuzz_parse_sysctl },
+    .{ .name = "parse_kernel", .run_iteration = parse_fuzz.fuzz_parse_kernel },
+    .{ .name = "parse_cgroup", .run_iteration = parse_fuzz.fuzz_parse_cgroup },
+    .{ .name = "parse_controllers", .run_iteration = parse_fuzz.fuzz_parse_controllers },
+    .{ .name = "parse_subid", .run_iteration = parse_fuzz.fuzz_parse_subid },
+    .{ .name = "parse_passwd", .run_iteration = parse_fuzz.fuzz_parse_passwd },
+    .{ .name = "parse_seccomp", .run_iteration = parse_fuzz.fuzz_parse_seccomp },
+    .{ .name = "parse_capability", .run_iteration = parse_fuzz.fuzz_parse_capability },
 };
 
 const content_bytes_max: u32 = 300;
@@ -121,6 +135,13 @@ fn fuzz_host_write(seed: u64) void {
     }
 }
 
+fn only_write_faults(faults: Faults) Faults {
+    return .{
+        .write_error_per_mille = faults.write_error_per_mille,
+        .short_write_per_mille = faults.short_write_per_mille,
+    };
+}
+
 /// Arguments for one CLI fuzz case, replayable: both runs get an identical copy.
 const FuzzArgs = struct {
     items: [constants.args_count_max + 3][]const u8,
@@ -193,6 +214,10 @@ fn fuzz_cli(seed: u64) void {
     faulted.faults = random_faults(random);
     if (random.boolean()) faulted.faults.fail_call_index = random.uintLessThan(u32, 3);
     faulted.faults.fail_call_error = random_injected_error(random);
+    // The doctor reads the host, so read faults change what it reports (that is the doctor
+    // fuzzer's subject); here only the output path is faulted for it.
+    const runs_doctor = args.count > 1 and std.mem.eql(u8, args.items[1], "doctor");
+    if (runs_doctor) faulted.faults = only_write_faults(faulted.faults);
     var faulted_args = args;
     const faulted_code = cli.run_from_iterator(faulted.interface(), &faulted_args);
 
@@ -213,6 +238,118 @@ fn fuzz_cli(seed: u64) void {
     } else {
         assert(faulted_code == constants.exit_failed);
     }
+}
+
+/// An independent statement of "printable" (space to tilde), so a wrong `is_printable` is caught.
+fn is_printable_reference(byte: u8) bool {
+    return byte >= 0x20 and byte <= 0x7e;
+}
+
+/// Property: sanitised text is printable ASCII, fits the storage, equals the input when the
+/// input is already printable and short enough, and a Bounded string never exceeds its capacity.
+fn fuzz_text(seed: u64) void {
+    var prng = std.Random.Xoshiro256.init(seed);
+    const random = prng.random();
+    var input: [96]u8 = undefined;
+    const length = random.uintAtMost(usize, input.len);
+    random.bytes(input[0..length]);
+    if (random.boolean()) {
+        for (input[0..length]) |*byte| byte.* = 0x20 + byte.* % 0x5f;
+    }
+    var storage: [32]u8 = undefined;
+    const clean = text_util.sanitise(&storage, input[0..length]);
+    assert(clean.len <= storage.len);
+    for (clean) |byte| assert(is_printable_reference(byte));
+    if (length <= storage.len) {
+        assert(clean.len == length);
+        const printable = for (input[0..length]) |byte| {
+            if (!is_printable_reference(byte)) break false;
+        } else true;
+        if (printable) assert(std.mem.eql(u8, clean, input[0..length]));
+    } else {
+        assert(clean.len == storage.len);
+        assert(std.mem.endsWith(u8, clean, "..."));
+    }
+
+    var bounded: text_util.Bounded(24) = .{};
+    for (0..random.uintAtMost(u8, 6)) |_| bounded.append_sanitised(input[0..length], 12);
+    assert(bounded.len <= 24);
+    for (bounded.slice()) |byte| assert(is_printable_reference(byte));
+}
+
+/// Errors a doctor fault may inject. NotFound is excluded because it is a legitimate answer
+/// ("this sysctl does not exist"), indistinguishable from an injected one.
+fn random_doctor_error(random: std.Random) host.Error {
+    const choices = [_]host.Error{
+        error.IoFailed,    error.OutOfMemory, error.AccessDenied,
+        error.NoSpace,     error.WouldBlock,  error.Unsupported,
+        error.Interrupted,
+    };
+    return choices[random.uintLessThan(usize, choices.len)];
+}
+
+/// Property, per check, comparing a fault-free run with a faulted run of the same host:
+///  - if a hard error (anything but an interrupt) was injected into the check's gather, the
+///    check is FAIL; a fault is never answered ok or warn;
+///  - if nothing at all was injected into it, the check equals the fault-free result;
+///  - every report is well formed (fails have a fix, oks have none) and the exit code is 1
+///    exactly when some check is FAIL; no handle leaks.
+fn fuzz_doctor(seed: u64) void {
+    var prng = std.Random.Xoshiro256.init(seed);
+    const random = prng.random();
+    const fixture = &fixtures.all[random.uintLessThan(usize, fixtures.all.len)];
+
+    var reference: HostSim = undefined;
+    reference.init(1, fixture.files);
+    fixture.apply(&reference);
+    var facts: doctor.Facts = undefined;
+    facts.reset();
+    doctor.gather(reference.interface(), &facts);
+    var expected: doctor.Report = undefined;
+    doctor.evaluate(&facts, &expected);
+
+    var faulted: HostSim = undefined;
+    faulted.init(random.int(u64), fixture.files);
+    fixture.apply(&faulted);
+    faulted.faults = random_faults(random);
+    faulted.faults.write_error_per_mille = 0;
+    if (random.boolean()) faulted.faults.fail_call_index = random.uintLessThan(u32, 48);
+    faulted.faults.fail_call_error = random_doctor_error(random);
+
+    var injected: [constants.doctor_checks_count]struct { hard: u32, any: u32 } = undefined;
+    facts.reset();
+    for (std.enums.values(doctor.CheckId), 0..) |id, index| {
+        const hard_before = faulted.hard_errors_injected;
+        const interrupts_before = faulted.interrupts_injected;
+        doctor.gather_one(faulted.interface(), &facts, id);
+        const hard = faulted.hard_errors_injected - hard_before;
+        const interrupts = faulted.interrupts_injected - interrupts_before;
+        injected[index] = .{ .hard = hard, .any = hard + interrupts };
+    }
+    var report: doctor.Report = undefined;
+    doctor.evaluate(&facts, &report);
+    assert(faulted.open_count() == 0);
+    check_doctor_report(&report, &expected, &injected);
+}
+
+fn check_doctor_report(
+    report: *const doctor.Report,
+    expected: *const doctor.Report,
+    injected: anytype,
+) void {
+    report.validate();
+    var any_fail = false;
+    for (report.checks, expected.checks, injected) |check, reference, counts| {
+        if (check.status == .fail) any_fail = true;
+        if (counts.hard > 0) assert(check.status == .fail);
+        if (counts.any == 0) {
+            assert(check.status == reference.status);
+            assert(std.mem.eql(u8, check.detail.slice(), reference.detail.slice()));
+            assert(std.mem.eql(u8, check.fix.slice(), reference.fix.slice()));
+        }
+    }
+    const code = report.exit_code();
+    assert(code == if (any_fail) constants.exit_failed else constants.exit_ok);
 }
 
 const Parsed = struct {

@@ -35,6 +35,8 @@ pub const Error = error{
     /// An operation made no progress within its call bound (a livelock guard).
     Stalled,
     Unsupported,
+    /// The file exists but does not have the requested extended attribute.
+    NoData,
     IoFailed,
 };
 
@@ -67,11 +69,29 @@ pub const Uname = struct {
     machine: Text,
 };
 
-/// Probes run in a forked child so a failed probe cannot damage the caller. The real
-/// implementation arrives with the doctor in slice 2.
+/// File type and permission bits, and the owner, as `stat` reports them.
+pub const Stat = struct {
+    mode: u32,
+    uid: u32,
+};
+
+/// Probes run in a forked child so a failed probe cannot damage the caller. The child runs as
+/// an unprivileged user even when the caller is root, so the answer is about ordinary users.
 pub const ProbeKind = enum { userns, overlay };
 
-pub const ProbeOutcome = enum { ok, denied, failed, timed_out };
+pub const ProbeOutcome = enum {
+    ok,
+    /// The operation under test was refused (EPERM, EACCES, ENOSPC, ENODEV, EINVAL ...).
+    denied,
+    /// Overlay only: the child could not enter the user and mount namespaces the probe needs.
+    setup_denied,
+    /// The child failed for a reason that says nothing about the feature (no memory, ...).
+    failed,
+    /// The child was killed by a signal.
+    signaled,
+    /// The child did not finish within the probe timeout and was killed and reaped.
+    timed_out,
+};
 
 pub const VTable = struct {
     open_read: *const fn (context: *anyopaque, path: [:0]const u8) Error!Handle,
@@ -79,7 +99,19 @@ pub const VTable = struct {
     close: *const fn (context: *anyopaque, handle: Handle) void,
     write: *const fn (context: *anyopaque, stream: Stream, bytes: []const u8) Error!u32,
     uname: *const fn (context: *anyopaque) Error!Uname,
-    stat_mode: *const fn (context: *anyopaque, path: [:0]const u8) Error!u32,
+    stat: *const fn (context: *anyopaque, path: [:0]const u8) Error!Stat,
+    /// Reads the raw `security.capability` xattr. Returns `NoData` if the file has none and
+    /// `FileTooLarge` if it does not fit `buffer`.
+    read_capability: *const fn (
+        context: *anyopaque,
+        path: [:0]const u8,
+        buffer: []u8,
+    ) Error!u32,
+    /// The mode of the seccomp filter of this process, from `prctl(PR_GET_SECCOMP)`.
+    seccomp_mode: *const fn (context: *anyopaque) Error!u32,
+    is_terminal: *const fn (context: *anyopaque, stream: Stream) bool,
+    /// The real user id of this process.
+    uid: *const fn (context: *anyopaque) u32,
     probe: *const fn (context: *anyopaque, kind: ProbeKind) Error!ProbeOutcome,
 };
 
@@ -139,13 +171,36 @@ pub const Host = struct {
         return result;
     }
 
-    pub fn stat_mode(host: Host, path: []const u8) Error!u32 {
+    pub fn stat(host: Host, path: []const u8) Error!Stat {
         var path_z: PathZ = undefined;
         const path_sentinel = try path_z.init(path);
         assert(path_sentinel.len == path.len);
-        const mode = try host.vtable.stat_mode(host.context, path_sentinel);
-        assert(mode <= std.math.maxInt(u16)); // st_mode is 16 bits in the kernel ABI.
-        return mode;
+        const result = try host.vtable.stat(host.context, path_sentinel);
+        assert(result.mode <= std.math.maxInt(u16)); // st_mode is 16 bits in the kernel ABI.
+        return result;
+    }
+
+    /// Returns the filled prefix of `buffer`.
+    pub fn read_capability(host: Host, path: []const u8, buffer: []u8) Error![]u8 {
+        assert(buffer.len > 0);
+        assert(buffer.len <= constants.capability_bytes_max);
+        var path_z: PathZ = undefined;
+        const path_sentinel = try path_z.init(path);
+        const length = try host.vtable.read_capability(host.context, path_sentinel, buffer);
+        assert(length <= buffer.len);
+        return buffer[0..length];
+    }
+
+    pub fn seccomp_mode(host: Host) Error!u32 {
+        return host.vtable.seccomp_mode(host.context);
+    }
+
+    pub fn is_terminal(host: Host, stream: Stream) bool {
+        return host.vtable.is_terminal(host.context, stream);
+    }
+
+    pub fn uid(host: Host) u32 {
+        return host.vtable.uid(host.context);
     }
 
     pub fn probe(host: Host, kind: ProbeKind) Error!ProbeOutcome {

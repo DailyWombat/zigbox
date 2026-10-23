@@ -24,5 +24,9 @@ test {
     _ = @import("host_real.zig");
     _ = @import("host_sim.zig");
     _ = @import("cli.zig");
+    _ = @import("parse.zig");
+    _ = @import("text.zig");
+    _ = @import("doctor.zig");
+    _ = @import("doctor_fixtures.zig");
     _ = @import("test_util.zig");
 }
