@@ -9,7 +9,7 @@ Zigbox is a rootless, daemonless Linux container runtime, image store and builde
 - A milestone is done only when its demo script runs live in the test VM. Unit tests passing, or code that compiles, is never reported as a passed demo. Say exactly what was and was not run.
 - Each demo script becomes an automated test, `zig build demo-mN`. Never break an earlier demo: all prior `demo-mN` tests run in CI.
 - Error messages are part of the demo: one line saying what was refused and why, never an `errno` dump.
-- When scope is in doubt, cut scope and keep the demo. Record the cut in the milestone's `DEMO.md`.
+- When scope is in doubt, cut scope and keep the demo. Record the cut in the milestone's demo document, `docs/demos/mN.md`.
 - Zig version is pinned in `build.zig.zon` (`minimum_zig_version`) and CI. Do not upgrade during a milestone.
 - No third-party dependencies; standard library only (see STYLE.md for the allowed external programs).
 - No libc: never set `link_libc`. Release targets are `x86_64-linux` and `aarch64-linux`, static, built `ReleaseSafe` so assertions stay on.
