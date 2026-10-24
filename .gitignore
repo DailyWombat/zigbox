@@ -1,0 +1,4 @@
+# Build outputs and caches. The Zig toolchain itself is never committed.
+zig-out/
+.zig-cache/
+zig-pkg/

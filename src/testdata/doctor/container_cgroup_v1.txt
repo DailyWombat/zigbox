@@ -1,0 +1,6 @@
+ok   kernel  6.18.44-fc-v153 x86_64 (minimum 5.15)
+ok   userns  user.max_user_namespaces=64280, unshare(CLONE_NEWUSER) works
+FAIL cgroup  cgroup v2 is not mounted at /sys/fs/cgroup (cgroup v1 or hybrid host) — fix: boot with systemd.unified_cgroup_hierarchy=1 or use a cgroup v2 distro
+ok   overlay  overlayfs mounts inside a user and mount namespace
+FAIL subid  root (uid 0); no subuid range of 65536 ids (largest: 0); no subgid range of 65536 ids (largest: 0); newuidmap not found; newgidmap not found — fix: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 root; install uidmap (apt install uidmap / dnf install shadow-utils)
+ok   seccomp  seccomp is supported (current mode: disabled for this process)

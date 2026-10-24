@@ -1,0 +1,6 @@
+ok   kernel  6.8.0-sim x86_64 (minimum 5.15)
+FAIL userns  /proc/sys/user/max_user_namespaces does not exist — fix: use a kernel built with CONFIG_USER_NS=y
+FAIL cgroup  cgroup v2 is not mounted at /sys/fs/cgroup (cgroup v1 or hybrid host) — fix: boot with systemd.unified_cgroup_hierarchy=1 or use a cgroup v2 distro
+ok   overlay  overlayfs mounts inside a user and mount namespace
+FAIL subid  uid 1000 (no passwd entry, matched by uid only); no subuid range of 65536 ids (largest: 0); no subgid range of 65536 ids (largest: 0); newuidmap not found; newgidmap not found — fix: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un); install uidmap (apt install uidmap / dnf install shadow-utils)
+FAIL seccomp  cannot read /proc/self/status: not found — fix: retry; if it persists, check the permissions and health of /proc/self/status

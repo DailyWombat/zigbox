@@ -1,0 +1,1 @@
+zbx: missing command; run 'zbx help'

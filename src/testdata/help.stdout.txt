@@ -1,0 +1,8 @@
+zbx - rootless container runtime
+
+usage: zbx <command>
+
+commands:
+  doctor      check that this host can run zbx
+  help        show this text
+  --version   print the version

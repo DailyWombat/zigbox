@@ -1,0 +1,6 @@
+ok   kernel  6.8.0-45-generic x86_64 (minimum 5.15)
+ok   userns  user.max_user_namespaces=63488, unshare(CLONE_NEWUSER) works
+FAIL cgroup  cgroup.controllers of the user manager is malformed — fix: check the file; the kernel writes space-separated lowercase names
+ok   overlay  overlayfs mounts inside a user and mount namespace
+ok   subid  alice (uid 1000): subuid 65536 ids, subgid 65536 ids; newuidmap: setuid root, newgidmap: setuid root
+ok   seccomp  seccomp is supported (current mode: disabled for this process)

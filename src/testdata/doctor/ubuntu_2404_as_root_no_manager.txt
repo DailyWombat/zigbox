@@ -1,0 +1,6 @@
+ok   kernel  6.8.0-45-generic x86_64 (minimum 5.15)
+ok   userns  user.max_user_namespaces=63488, unshare(CLONE_NEWUSER) works
+FAIL cgroup  no systemd user manager for uid 0: /sys/fs/cgroup/user.slice/user-0.slice/user@0.service does not exist — fix: log in through a systemd (logind) session, or run: sudo loginctl enable-linger $(id -un)
+ok   overlay  overlayfs mounts inside a user and mount namespace
+FAIL subid  root (uid 0); no subuid range of 65536 ids (largest: 0); no subgid range of 65536 ids (largest: 0) — fix: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 root
+ok   seccomp  seccomp is supported (current mode: disabled for this process)

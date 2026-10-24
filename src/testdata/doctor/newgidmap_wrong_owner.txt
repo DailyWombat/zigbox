@@ -1,0 +1,6 @@
+ok   kernel  6.8.0-45-generic x86_64 (minimum 5.15)
+ok   userns  user.max_user_namespaces=63488, unshare(CLONE_NEWUSER) works
+ok   cgroup  cgroup v2, user@1000.service delegated to uid 1000: cpuset cpu io memory pids
+ok   overlay  overlayfs mounts inside a user and mount namespace
+FAIL subid  alice (uid 1000); newgidmap is neither setuid root nor has a usable file capability — fix: sudo chown root: $(command -v newuidmap newgidmap) && sudo chmod u+s $(command -v newuidmap newgidmap)
+ok   seccomp  seccomp is supported (current mode: disabled for this process)

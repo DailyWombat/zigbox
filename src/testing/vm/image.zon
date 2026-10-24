@@ -1,0 +1,7 @@
+.{
+    // Pinned by URL and SHA-256: a dated release of the Ubuntu 24.04 LTS cloud image, never a
+    // moving "current" link. Change both lines together, deliberately.
+    .url = "https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img",
+    .sha256 = "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
+    .file_name = "ubuntu-24.04-server-cloudimg-amd64.img",
+}

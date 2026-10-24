@@ -1,0 +1,6 @@
+ok   kernel  6.8.0-45-generic x86_64 (minimum 5.15)
+FAIL userns  the user namespace probe did not finish in 5000 ms and was killed — fix: retry; if it repeats, check dmesg and the audit log for the cause
+ok   cgroup  cgroup v2, user@1000.service delegated to uid 1000: cpuset cpu io memory pids
+FAIL overlay  the overlay probe did not finish in 5000 ms and was killed — fix: retry; if it repeats, check dmesg and the audit log for the cause
+ok   subid  alice (uid 1000): subuid 65536 ids, subgid 65536 ids; newuidmap: setuid root, newgidmap: setuid root
+ok   seccomp  seccomp is supported (current mode: disabled for this process)
